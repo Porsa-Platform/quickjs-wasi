@@ -1,4 +1,3 @@
-using QuickJsWasi.Interop;
 using Wasmtime;
 
 namespace QuickJsWasi.Interop;
