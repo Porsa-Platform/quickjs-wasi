@@ -108,6 +108,122 @@ public sealed class JSValueHandle : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// Get all own property names including non-enumerable ones
+    /// (equivalent to <c>Object.getOwnPropertyNames()</c>).
+    /// </summary>
+    public string[] GetOwnPropertyNames()
+    {
+        using var names = new JSValueHandle(Vm, Vm.Exports.GetOwnPropertyNamesAll(Ptr));
+        if (names.IsException)
+        {
+            return Array.Empty<string>();
+        }
+
+        using var lengthHandle = names.GetProp("length");
+        var length = Convert.ToInt32(lengthHandle.ToNumber());
+        var result = new string[length];
+        for (var i = 0; i < length; i++)
+        {
+            using var key = new JSValueHandle(Vm, Vm.Exports.GetPropUInt32(names.Ptr, (uint)i));
+            result[i] = key.ToManagedString();
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Get ALL own property keys — strings and symbols, including non-enumerable
+    /// (equivalent to <c>Reflect.ownKeys()</c>).
+    ///
+    /// String keys are returned as <see cref="string"/>; symbol keys are returned as
+    /// <see cref="JSValueHandle"/> instances which the caller must dispose.
+    /// </summary>
+    public IReadOnlyList<object> GetOwnPropertyKeys()
+    {
+        using var keys = new JSValueHandle(Vm, Vm.Exports.GetOwnPropertyKeys(Ptr));
+        if (keys.IsException)
+        {
+            return Array.Empty<object>();
+        }
+
+        using var lengthHandle = keys.GetProp("length");
+        var length = Convert.ToInt32(lengthHandle.ToNumber());
+        var result = new List<object>(length);
+        for (var i = 0; i < length; i++)
+        {
+            var keyHandle = new JSValueHandle(Vm, Vm.Exports.GetPropUInt32(keys.Ptr, (uint)i));
+            if (keyHandle.IsSymbol)
+            {
+                result.Add(keyHandle); // caller must dispose
+            }
+            else
+            {
+                result.Add(keyHandle.ToManagedString());
+                keyHandle.Dispose();
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Get the own property descriptor for a key without invoking getters
+    /// (equivalent to <c>Object.getOwnPropertyDescriptor()</c>).
+    ///
+    /// Returns <c>null</c> if there is no such own property.
+    /// The caller owns and must dispose the returned descriptor's handles.
+    /// </summary>
+    public JSOwnPropertyDescriptor? GetOwnPropertyDescriptor(string key)
+    {
+        using var keyHandle = Vm.NewString(key);
+        return GetOwnPropertyDescriptor(keyHandle);
+    }
+
+    /// <summary>
+    /// Get the own property descriptor for a key (string or symbol) without invoking getters
+    /// (equivalent to <c>Object.getOwnPropertyDescriptor()</c>).
+    ///
+    /// Returns <c>null</c> if there is no such own property.
+    /// The caller owns and must dispose the returned descriptor's handles.
+    /// </summary>
+    public JSOwnPropertyDescriptor? GetOwnPropertyDescriptor(JSValueHandle key)
+    {
+        var descPtr = Vm.Exports.GetOwnPropertyDescriptor(Ptr, key.Ptr);
+        if (descPtr == 0) return null;
+
+        using var descHandle = new JSValueHandle(Vm, descPtr);
+        if (descHandle.IsException)
+        {
+            throw new JSException(Vm.GetException());
+        }
+
+        using var enumerableHandle = descHandle.GetProp("enumerable");
+        using var configurableHandle = descHandle.GetProp("configurable");
+        var enumerable = Vm.Exports.GetBool(enumerableHandle.Ptr) != 0;
+        var configurable = Vm.Exports.GetBool(configurableHandle.Ptr) != 0;
+
+        if (descHandle.HasOwnProperty("value"))
+        {
+            using var writableHandle = descHandle.GetProp("writable");
+            return new JSOwnPropertyDescriptor
+            {
+                Value = descHandle.GetProp("value"),
+                Writable = Vm.Exports.GetBool(writableHandle.Ptr) != 0,
+                Enumerable = enumerable,
+                Configurable = configurable,
+            };
+        }
+
+        return new JSOwnPropertyDescriptor
+        {
+            Get = descHandle.GetProp("get"),
+            Set = descHandle.GetProp("set"),
+            Enumerable = enumerable,
+            Configurable = configurable,
+        };
+    }
+
     public bool HasOwnProperty(string name)
     {
         var written = Vm.WriteString(name);

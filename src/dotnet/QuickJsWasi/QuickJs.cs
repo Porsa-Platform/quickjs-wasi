@@ -47,6 +47,21 @@ public sealed class QuickJs : IDisposable
     public JSValueHandle TrueValue { get; private set; } = null!;
     public JSValueHandle FalseValue { get; private set; } = null!;
 
+    /// <summary>
+    /// Version information for the runtime. Always includes <c>"quickjs"</c> (the QuickJS engine version).
+    /// </summary>
+    public IReadOnlyDictionary<string, string> Versions
+    {
+        get
+        {
+            var qjsVersion = ReadCString(Exports.GetQuickJsVersion());
+            return new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["quickjs"] = qjsVersion,
+            };
+        }
+    }
+
     public static Task<QuickJs> CreateAsync(QuickJsOptions? options = null)
     {
         options ??= new QuickJsOptions();
@@ -174,13 +189,51 @@ public sealed class QuickJs : IDisposable
             Function.FromCallback(Store, (Caller caller, int baseNamePtr, int namePtr) =>
             {
                 var memory = caller.GetMemory("memory") ?? memoryAccessor() ?? throw new InvalidOperationException("WASM memory is not available.");
-                var name = WasmMemoryAccessor.ReadCString(memory, caller, namePtr);
-                var written = WriteString(name);
-                return written.Ptr;
+                var normalize = options.ModuleLoader?.Normalize;
+                if (normalize is null)
+                {
+                    // No normalize handler — return a copy of the specifier unchanged
+                    var name = WasmMemoryAccessor.ReadCString(memory, caller, namePtr);
+                    return WriteString(name).Ptr;
+                }
+
+                var baseName = WasmMemoryAccessor.ReadCString(memory, caller, baseNamePtr);
+                var specifier = WasmMemoryAccessor.ReadCString(memory, caller, namePtr);
+                try
+                {
+                    var normalized = normalize(baseName, specifier);
+                    return WriteString(normalized).Ptr;
+                }
+                catch (Exception ex)
+                {
+                    using var err = NewError(ex);
+                    Exports.Throw(err.Ptr);
+                    return 0;
+                }
             }));
 
         _linker.Define("env", "host_module_load",
-            Function.FromCallback(Store, (int namePtr, int outLenPtr) => 0));
+            Function.FromCallback(Store, (Caller caller, int namePtr, int outLenPtr) =>
+            {
+                var load = options.ModuleLoader?.Load;
+                if (load is null) return 0;
+
+                var memory = caller.GetMemory("memory") ?? memoryAccessor() ?? throw new InvalidOperationException("WASM memory is not available.");
+                var name = WasmMemoryAccessor.ReadCString(memory, caller, namePtr);
+                try
+                {
+                    var source = load(name);
+                    var written = WriteString(source);
+                    WasmMemoryAccessor.WriteInt32(Exports.Memory, outLenPtr, written.Length);
+                    return written.Ptr;
+                }
+                catch (Exception ex)
+                {
+                    using var err = NewError(ex);
+                    Exports.Throw(err.Ptr);
+                    return 0;
+                }
+            }));
 
         _linker.Define("env", "host_get_timezone_offset",
             Function.FromCallback(Store, (int hi, int lo) => ResolveTimezoneOffset(options.TimezoneOffset, ((long)hi << 32) | (uint)lo)));
@@ -207,12 +260,31 @@ public sealed class QuickJs : IDisposable
             Exports.SetMemoryLimit(checked((int)limit));
         }
 
+        if (options.MaxStackSize is long stackSize)
+        {
+            Exports.SetMaxStackSize(checked((int)stackSize));
+        }
+
         Exports.SetInterruptHandler(options.InterruptHandler is null ? 0 : 1);
         Exports.SetPromiseRejectionHandler(options.OnUnhandledRejection is null ? 0 : 1);
+        Exports.SetModuleLoader(options.ModuleLoader is null ? 0 : 1);
     }
 
     internal bool TryGetHostCallback(string name, out HostFunction callback)
         => _hostCallbacks.TryGetValue(name, out callback!);
+
+    /// <summary>
+    /// Re-register a host callback after restoring from a snapshot.
+    /// The name must match the name passed to <see cref="NewHostFunction"/> before the snapshot.
+    /// Unlike <see cref="NewHostFunction"/>, this method does not create a new WASM function object
+    /// and does not throw if a callback with the same name is already registered.
+    /// </summary>
+    public void RegisterHostCallback(string name, HostFunction callback)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ArgumentNullException.ThrowIfNull(callback);
+        _hostCallbacks[name] = callback;
+    }
 
     internal (int Ptr, int Length) WriteString(string value)
     {
@@ -342,6 +414,86 @@ public sealed class QuickJs : IDisposable
     public JSValueHandle GetException() => new(this, Exports.GetException());
 
     public JSValueHandle GetPromiseResult(JSValueHandle promise) => new(this, Exports.PromiseResult(promise.Ptr));
+
+    /// <summary>
+    /// Resolve a promise handle. Returns a host-side <see cref="Task{T}"/> that resolves
+    /// when the QuickJS promise settles.
+    ///
+    /// <para>
+    /// If the handle is not a promise, it is treated as an already-fulfilled value.
+    /// </para>
+    /// <para>
+    /// The returned task resolves to a <see cref="JSPromiseResult.Fulfilled"/> or
+    /// <see cref="JSPromiseResult.Rejected"/>. The caller owns the handle inside the result
+    /// and must dispose it.
+    /// </para>
+    /// <para>
+    /// <b>Important:</b> You must call <see cref="ExecutePendingJobs"/> after setting up
+    /// any promises to pump the microtask queue. The task will complete only after the
+    /// promise has settled.
+    /// </para>
+    /// </summary>
+    public Task<JSPromiseResult> ResolvePromise(JSValueHandle promise)
+    {
+        ArgumentNullException.ThrowIfNull(promise);
+
+        if (!promise.IsPromise)
+        {
+            return Task.FromResult<JSPromiseResult>(new JSPromiseResult.Fulfilled(promise.Dup()));
+        }
+
+        // Check if already settled
+        var state = Exports.PromiseState(promise.Ptr);
+        if (state == 1) // fulfilled
+        {
+            return Task.FromResult<JSPromiseResult>(new JSPromiseResult.Fulfilled(new JSValueHandle(this, Exports.PromiseResult(promise.Ptr))));
+        }
+        else if (state == 2) // rejected
+        {
+            return Task.FromResult<JSPromiseResult>(new JSPromiseResult.Rejected(new JSValueHandle(this, Exports.PromiseResult(promise.Ptr))));
+        }
+
+        // Pending — attach internal .then/.catch callbacks to get notified
+        var tcs = new TaskCompletionSource<JSPromiseResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var id = Guid.NewGuid().ToString("N");
+        var fulfilledName = $"__onFulfilled:{id}";
+        var rejectedName = $"__onRejected:{id}";
+
+        HostFunction onFulfilled = (_, args) =>
+        {
+            var val = args.Count > 0 ? args[0].Dup() : UndefinedValue;
+            _hostCallbacks.Remove(fulfilledName);
+            _hostCallbacks.Remove(rejectedName);
+            tcs.TrySetResult(new JSPromiseResult.Fulfilled(val));
+            return UndefinedValue;
+        };
+        HostFunction onRejected = (_, args) =>
+        {
+            var val = args.Count > 0 ? args[0].Dup() : UndefinedValue;
+            _hostCallbacks.Remove(fulfilledName);
+            _hostCallbacks.Remove(rejectedName);
+            tcs.TrySetResult(new JSPromiseResult.Rejected(val));
+            return UndefinedValue;
+        };
+
+        _hostCallbacks[fulfilledName] = onFulfilled;
+        _hostCallbacks[rejectedName] = onRejected;
+
+        var fulfilledWritten = WriteString(fulfilledName);
+        var onFulfilledHandle = new JSValueHandle(this, Exports.NewHostFunction(fulfilledWritten.Ptr, fulfilledWritten.Length, 1));
+        Exports.WasmFree(fulfilledWritten.Ptr);
+
+        var rejectedWritten = WriteString(rejectedName);
+        var onRejectedHandle = new JSValueHandle(this, Exports.NewHostFunction(rejectedWritten.Ptr, rejectedWritten.Length, 1));
+        Exports.WasmFree(rejectedWritten.Ptr);
+
+        using var thenFn = promise.GetProp("then");
+        CallFunctionRaw(thenFn, promise, onFulfilledHandle, onRejectedHandle).Dispose();
+        onFulfilledHandle.Dispose();
+        onRejectedHandle.Dispose();
+
+        return tcs.Task;
+    }
 
     public JSValueHandle NewString(string value)
     {
@@ -478,6 +630,56 @@ public sealed class QuickJs : IDisposable
     {
         get => Exports.GetGcThreshold();
         set => Exports.SetGcThreshold(value);
+    }
+
+    /// <summary>
+    /// Get detailed memory usage statistics from the QuickJS runtime.
+    /// Returns counts and sizes for atoms, strings, objects, functions, etc.
+    /// </summary>
+    public MemoryUsage GetMemoryUsage()
+    {
+        // Allocate a buffer for 26 int64 fields (26 * 8 = 208 bytes)
+        const int fieldCount = 26;
+        var bufPtr = Exports.WasmMalloc(fieldCount * 8);
+        try
+        {
+            Exports.ComputeMemoryUsage(bufPtr);
+            var bytes = WasmMemoryAccessor.ReadBytes(Exports.Memory, bufPtr, fieldCount * 8);
+            long ReadI64(int idx) => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(bytes.AsSpan(idx * 8, 8));
+            return new MemoryUsage
+            {
+                MallocSize = ReadI64(0),
+                MallocLimit = ReadI64(1),
+                MemoryUsedSize = ReadI64(2),
+                MallocCount = ReadI64(3),
+                MemoryUsedCount = ReadI64(4),
+                AtomCount = ReadI64(5),
+                AtomSize = ReadI64(6),
+                StrCount = ReadI64(7),
+                StrSize = ReadI64(8),
+                ObjCount = ReadI64(9),
+                ObjSize = ReadI64(10),
+                PropCount = ReadI64(11),
+                PropSize = ReadI64(12),
+                ShapeCount = ReadI64(13),
+                ShapeSize = ReadI64(14),
+                JsFuncCount = ReadI64(15),
+                JsFuncSize = ReadI64(16),
+                JsFuncCodeSize = ReadI64(17),
+                JsFuncPc2LineCount = ReadI64(18),
+                JsFuncPc2LineSize = ReadI64(19),
+                CFuncCount = ReadI64(20),
+                ArrayCount = ReadI64(21),
+                FastArrayCount = ReadI64(22),
+                FastArrayElements = ReadI64(23),
+                BinaryObjectCount = ReadI64(24),
+                BinaryObjectSize = ReadI64(25),
+            };
+        }
+        finally
+        {
+            Exports.WasmFree(bufPtr);
+        }
     }
 
     public string TypeOf(JSValueHandle handle)
