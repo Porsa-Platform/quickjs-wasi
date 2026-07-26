@@ -84,14 +84,14 @@ jobs:
 
       - name: Pack NuGet package
         run: |
-          VERSION_ARG=""
+          VERSION_ARGS=()
           if [[ -n "${{ steps.pkg_version.outputs.version }}" ]]; then
-            VERSION_ARG="-p:Version=${{ steps.pkg_version.outputs.version }}"
+            VERSION_ARGS=("-p:Version=${{ steps.pkg_version.outputs.version }}")
           fi
           dotnet pack src/dotnet/QuickJsWasi/QuickJsWasi.csproj \
             --no-build -c Release \
             -o nupkg \
-            $VERSION_ARG
+            "${VERSION_ARGS[@]}"
 
       - name: Upload NuGet artifact
         uses: actions/upload-artifact@v4
