@@ -100,6 +100,13 @@ jobs:
           path: nupkg/
           if-no-files-found: error
 
+      - name: Upload QuickJs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: quickjs-wasm-${{ steps.pkg_version.outputs.version }}
+          path: src/dotnet/QuickJsWasi/Resources/quickjs.wasm
+          if-no-files-found: error
+
   # ── 2. Publish to NuGet.org (tag-triggered only) ─────────────────────────
   publish:
     name: Publish to NuGet.org
@@ -110,7 +117,7 @@ jobs:
 
     permissions:
       contents: read
-      id-token: write   # needed for attestation / provenance (optional but recommended)
+      id-token: write # needed for attestation / provenance (optional but recommended)
 
     steps:
       # Extract the semver from the tag (dotnet/v1.2.3 → 1.2.3) so callers
