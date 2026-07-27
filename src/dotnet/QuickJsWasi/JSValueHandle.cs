@@ -254,6 +254,7 @@ public sealed class JSValueHandle : IDisposable
     public JSValueHandle GetProxyTarget() => new(Vm, Vm.Exports.GetProxyTarget(Ptr));
     public JSValueHandle GetProxyHandler() => new(Vm, Vm.Exports.GetProxyHandler(Ptr));
     public double ToNumber() => Vm.Exports.GetFloat64(Ptr);
+    public bool ToBool() => Vm.Exports.GetBool(Ptr) != 0;
 
     public long ToInt64()
     {

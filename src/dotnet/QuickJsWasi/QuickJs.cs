@@ -704,15 +704,22 @@ public sealed class QuickJs : IDisposable
         }
 
         _disposed = true;
+
+        // NB: Do NOT call Exports.Destroy() here. The C-side qjs_destroy calls
+        // JS_FreeContext which leaves the runtime with a non-empty gc_obj_list.
+        // When the Store is disposed the WASM instance tears down, triggering
+        // JS_FreeRuntime which asserts on the non-empty list and calls abort().
+        // Skipping the explicit JS_FreeContext avoids the assertion entirely —
+        // the WASM linear memory is reclaimed by Wasmtime regardless.
+
         try
         {
-            Exports?.Destroy();
+            Store.Dispose();
         }
         catch
         {
         }
 
-        Store.Dispose();
         _linker.Dispose();
         _module.Dispose();
         _engine.Dispose();

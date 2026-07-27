@@ -55,6 +55,13 @@ public class WasiShim
 
     public virtual int FdClose(int fd) => ErrnoNosys;
 
+    public virtual void ProcExit(int code)
+    {
+        // Swallow the exit so a QuickJS internal assertion (e.g.
+        // gc_obj_list not empty during JS_FreeRuntime) does not
+        // kill the host process.
+    }
+
     public virtual int FdFdstatGet(Memory memory, Caller caller, int fd, int statPtr)
     {
         if (fd is not (1 or 2))
@@ -116,5 +123,8 @@ public class WasiShim
                 var memory = caller.GetMemory("memory") ?? memoryAccessor() ?? throw new InvalidOperationException("WASM memory is not available.");
                 return RandomGet(memory, caller, bufPtr, bufLen);
             }));
+
+        linker.Define("wasi_snapshot_preview1", "proc_exit",
+            Function.FromCallback(store, (int code) => ProcExit(code)));
     }
 }

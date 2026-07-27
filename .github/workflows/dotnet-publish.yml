@@ -63,13 +63,13 @@ jobs:
           dotnet-version: ${{ matrix.dotnet }}
 
       - name: Restore dependencies
-        run: dotnet restore src/dotnet/QuickJsWasi.sln
+        run: dotnet restore src/dotnet/QuickJsWasi.slnx
 
       - name: Build solution
-        run: dotnet build src/dotnet/QuickJsWasi.sln --no-restore -c Release
+        run: dotnet build src/dotnet/QuickJsWasi.slnx --no-restore -c Release
 
       - name: Run tests
-        run: dotnet test src/dotnet/QuickJsWasi.sln --no-build -c Release --logger "console;verbosity=normal"
+        run: dotnet test src/dotnet/QuickJsWasi.slnx --no-build -c Release --logger "console;verbosity=normal"
 
       # Upload the packed WASM + DLL as a workflow artifact so the publish job
       # can reuse them without rebuilding from scratch.

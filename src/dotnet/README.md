@@ -5,6 +5,8 @@
 A .NET 10 library that embeds the [QuickJS-NG](https://github.com/nicowillis/quickjs-ng) JavaScript engine
 compiled to a WASI reactor WebAssembly binary and exposes it through a clean C# API. The key features are:
 
+> 📌 **A complete, runnable example covering every API feature is available in [`Sample.cs`](Sample.cs).**
+
 - **Snapshotable** — freeze the full VM state (including pending Promises) to bytes and restore it instantly in a fresh instance.
 - **ES Module loading** — supply a synchronous `ModuleLoader` to handle `import` statements.
 - **Host functions** — expose .NET methods as first-class JavaScript functions.
@@ -230,7 +232,7 @@ using var vm = await QuickJs.CreateAsync(new QuickJsOptions
 });
 
 using var promise = vm.Eval(
-    "import { add } from 'math.js'; add(3, 4);",
+    "import { add } from 'math.js'; export const result = add(3, 4);",
     filename: "<entry>",
     flags: EvalFlags.TYPE_MODULE);
 
@@ -239,8 +241,11 @@ vm.ExecutePendingJobs();
 var settled = await vm.ResolvePromise(promise);
 if (settled is JSPromiseResult.Fulfilled f)
 {
-    Console.WriteLine(f.Value.ToNumber()); // 7
-    f.Value.Dispose();
+    using (f.Value) // module namespace
+    {
+        using var r = f.Value.GetProp("result");
+        Console.WriteLine(r.ToNumber()); // 7
+    }
 }
 ```
 
@@ -639,21 +644,21 @@ using var exc = vm.GetException();
 
 `Dump` converts a `JSValueHandle` into a native .NET value:
 
-| JS type | .NET type |
-|---------|-----------|
-| `undefined` | `QuickJs.Undefined` (singleton object) |
-| `null` | `null` |
-| `boolean` | `bool` |
-| `number` | `double` |
-| `string` | `string` |
-| `bigint` | `long` |
-| `symbol` (global) | `JsSymbol` record |
-| `symbol` (local) | `QuickJs.Undefined` |
-| `ArrayBuffer` / typed array | `byte[]` |
-| `Error` | `Exception` |
-| `function` | `QuickJs.Undefined` |
-| `Array` | `object?[]` |
-| plain `object` | `Dictionary<string, object?>` |
+| JS type                     | .NET type                              |
+| --------------------------- | -------------------------------------- |
+| `undefined`                 | `QuickJs.Undefined` (singleton object) |
+| `null`                      | `null`                                 |
+| `boolean`                   | `bool`                                 |
+| `number`                    | `double`                               |
+| `string`                    | `string`                               |
+| `bigint`                    | `long`                                 |
+| `symbol` (global)           | `JsSymbol` record                      |
+| `symbol` (local)            | `QuickJs.Undefined`                    |
+| `ArrayBuffer` / typed array | `byte[]`                               |
+| `Error`                     | `Exception`                            |
+| `function`                  | `QuickJs.Undefined`                    |
+| `Array`                     | `object?[]`                            |
+| plain `object`              | `Dictionary<string, object?>`          |
 
 ```csharp
 using var val = vm.Eval("({ name: 'Alice', scores: [95, 87, 100], active: true })");
@@ -807,22 +812,22 @@ catch (JSException) { }
 
 Available flags:
 
-| Constant | Description |
-|----------|-------------|
-| `Intrinsics.DATE` | `Date` |
-| `Intrinsics.EVAL` | `eval()` / `Function()` |
-| `Intrinsics.REGEXP` | `RegExp` |
-| `Intrinsics.JSON` | `JSON` |
-| `Intrinsics.PROXY` | `Proxy` / `Reflect` |
-| `Intrinsics.MAP_SET` | `Map` / `Set` / `WeakMap` / `WeakSet` |
-| `Intrinsics.TYPED_ARRAYS` | `ArrayBuffer` / typed arrays / `DataView` |
-| `Intrinsics.PROMISE` | `Promise` / `async`/`await` |
-| `Intrinsics.BIG_INT` | `BigInt` |
-| `Intrinsics.WEAK_REF` | `WeakRef` / `FinalizationRegistry` |
-| `Intrinsics.PERFORMANCE` | `performance.now()` |
-| `Intrinsics.DOM_EXCEPTION` | `DOMException` |
-| `Intrinsics.ATOB_BTOA` | `atob()` / `btoa()` |
-| `Intrinsics.ALL` | All intrinsics (default) |
+| Constant                   | Description                               |
+| -------------------------- | ----------------------------------------- |
+| `Intrinsics.DATE`          | `Date`                                    |
+| `Intrinsics.EVAL`          | `eval()` / `Function()`                   |
+| `Intrinsics.REGEXP`        | `RegExp`                                  |
+| `Intrinsics.JSON`          | `JSON`                                    |
+| `Intrinsics.PROXY`         | `Proxy` / `Reflect`                       |
+| `Intrinsics.MAP_SET`       | `Map` / `Set` / `WeakMap` / `WeakSet`     |
+| `Intrinsics.TYPED_ARRAYS`  | `ArrayBuffer` / typed arrays / `DataView` |
+| `Intrinsics.PROMISE`       | `Promise` / `async`/`await`               |
+| `Intrinsics.BIG_INT`       | `BigInt`                                  |
+| `Intrinsics.WEAK_REF`      | `WeakRef` / `FinalizationRegistry`        |
+| `Intrinsics.PERFORMANCE`   | `performance.now()`                       |
+| `Intrinsics.DOM_EXCEPTION` | `DOMException`                            |
+| `Intrinsics.ATOB_BTOA`     | `atob()` / `btoa()`                       |
+| `Intrinsics.ALL`           | All intrinsics (default)                  |
 
 ---
 
@@ -972,91 +977,91 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 
 ### `QuickJs` (implements `IDisposable`)
 
-| Member | Description |
-|--------|-------------|
-| `CreateAsync(options?)` | Factory — create a fresh VM |
-| `RestoreAsync(snapshot, options?)` | Factory — restore from a snapshot |
-| `Eval(code, filename?, flags?)` | Evaluate JS source, returns `JSValueHandle` |
-| `Compile(code, filename?, evalFlags?, compileFlags?)` | Compile to `byte[]` bytecode |
-| `EvalBytecode(bytecode)` | Execute compiled bytecode |
-| `ExecutePendingJobs()` | Run the microtask queue; returns job count |
-| `ResolvePromise(promise)` | Await a QuickJS promise as `Task<JSPromiseResult>` |
-| `CallFunction(func, thisVal, args...)` | Call a JS function; throws on exception |
-| `NewString(value)` | Create a JS string |
-| `NewNumber(value)` | Create a JS number |
-| `NewBigInt64(value)` | Create a JS BigInt from a `long` |
-| `NewSymbol(description, isGlobal)` | Create a JS symbol |
-| `NewObject()` | Create an empty JS object |
-| `NewArray()` | Create an empty JS array |
-| `NewArrayBuffer(data)` | Create a JS `ArrayBuffer` (copies bytes) |
-| `NewUInt8Array(data)` | Create a JS `Uint8Array` (copies bytes) |
-| `NewError(message)` | Create a JS `Error` from a string |
-| `NewError(exception)` | Create a JS `Error` from a .NET exception |
-| `NewHostFunction(name, callback, argCount?)` | Register a host function callable from JS |
-| `RegisterHostCallback(name, callback)` | Re-bind a host callback after restore (no duplicate check) |
-| `NewPromise()` | Create a `Deferred` (handle + resolve + reject) |
-| `GetException()` | Retrieve the pending JS exception |
-| `GetPromiseResult(promise)` | Get the settled value of a promise |
-| `Dump(handle)` | Convert JS value → .NET object |
-| `HostToHandle(value)` | Convert .NET object → `JSValueHandle` |
-| `Snapshot()` | Capture VM state as `Snapshot` |
-| `RunGc()` | Trigger GC now |
-| `GetMemoryUsage()` | Detailed memory statistics (`MemoryUsage`) |
-| `TypeOf(handle)` | Returns the typeof string |
-| `Global` | The global object (singleton, do not dispose) |
-| `UndefinedValue / NullValue / TrueValue / FalseValue` | Cached singletons (do not dispose) |
-| `GcThreshold` | Get/set the auto-GC threshold in bytes |
-| `Versions` | `{ "quickjs": "x.y.z" }` |
-| `IsDisposed` | Whether the VM has been disposed |
-| `Dispose()` | Release all WASM resources |
+| Member                                                | Description                                                |
+| ----------------------------------------------------- | ---------------------------------------------------------- |
+| `CreateAsync(options?)`                               | Factory — create a fresh VM                                |
+| `RestoreAsync(snapshot, options?)`                    | Factory — restore from a snapshot                          |
+| `Eval(code, filename?, flags?)`                       | Evaluate JS source, returns `JSValueHandle`                |
+| `Compile(code, filename?, evalFlags?, compileFlags?)` | Compile to `byte[]` bytecode                               |
+| `EvalBytecode(bytecode)`                              | Execute compiled bytecode                                  |
+| `ExecutePendingJobs()`                                | Run the microtask queue; returns job count                 |
+| `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>`         |
+| `CallFunction(func, thisVal, args...)`                | Call a JS function; throws on exception                    |
+| `NewString(value)`                                    | Create a JS string                                         |
+| `NewNumber(value)`                                    | Create a JS number                                         |
+| `NewBigInt64(value)`                                  | Create a JS BigInt from a `long`                           |
+| `NewSymbol(description, isGlobal)`                    | Create a JS symbol                                         |
+| `NewObject()`                                         | Create an empty JS object                                  |
+| `NewArray()`                                          | Create an empty JS array                                   |
+| `NewArrayBuffer(data)`                                | Create a JS `ArrayBuffer` (copies bytes)                   |
+| `NewUInt8Array(data)`                                 | Create a JS `Uint8Array` (copies bytes)                    |
+| `NewError(message)`                                   | Create a JS `Error` from a string                          |
+| `NewError(exception)`                                 | Create a JS `Error` from a .NET exception                  |
+| `NewHostFunction(name, callback, argCount?)`          | Register a host function callable from JS                  |
+| `RegisterHostCallback(name, callback)`                | Re-bind a host callback after restore (no duplicate check) |
+| `NewPromise()`                                        | Create a `Deferred` (handle + resolve + reject)            |
+| `GetException()`                                      | Retrieve the pending JS exception                          |
+| `GetPromiseResult(promise)`                           | Get the settled value of a promise                         |
+| `Dump(handle)`                                        | Convert JS value → .NET object                             |
+| `HostToHandle(value)`                                 | Convert .NET object → `JSValueHandle`                      |
+| `Snapshot()`                                          | Capture VM state as `Snapshot`                             |
+| `RunGc()`                                             | Trigger GC now                                             |
+| `GetMemoryUsage()`                                    | Detailed memory statistics (`MemoryUsage`)                 |
+| `TypeOf(handle)`                                      | Returns the typeof string                                  |
+| `Global`                                              | The global object (singleton, do not dispose)              |
+| `UndefinedValue / NullValue / TrueValue / FalseValue` | Cached singletons (do not dispose)                         |
+| `GcThreshold`                                         | Get/set the auto-GC threshold in bytes                     |
+| `Versions`                                            | `{ "quickjs": "x.y.z" }`                                   |
+| `IsDisposed`                                          | Whether the VM has been disposed                           |
+| `Dispose()`                                           | Release all WASM resources                                 |
 
 ### `JSValueHandle` (implements `IDisposable`)
 
-| Member | Description |
-|--------|-------------|
-| `GetProp(name)` | Get property by string name |
-| `GetProp(key)` | Get property by symbol key |
-| `SetProp(name, value)` | Set property by string name |
-| `SetProp(key, value)` | Set property by symbol key |
-| `DefineProp(name, value, …)` | Define property with explicit descriptor flags |
-| `Keys()` | Enumerable own string property names |
-| `GetOwnPropertyNames()` | All own string property names (incl. non-enumerable) |
-| `GetOwnPropertyKeys()` | All own keys including symbols (`Reflect.ownKeys()`) |
-| `GetOwnPropertyDescriptor(key)` | Property descriptor without invoking getters |
-| `HasOwnProperty(name)` | `Object.prototype.hasOwnProperty` |
-| `PropertyIsEnumerable(name)` | `Object.prototype.propertyIsEnumerable` |
-| `GetPrototypeOf()` | Get the prototype |
-| `GetProxyTarget()` | Get `[[ProxyTarget]]` (trap-free) |
-| `GetProxyHandler()` | Get `[[ProxyHandler]]` (trap-free) |
-| `Dup()` | Duplicate (increment refcount) |
-| `ToNumber()` | Extract as `double` |
-| `ToInt64()` | Extract BigInt as `long` |
-| `ToManagedString()` | Extract as `string` |
-| `ToByteArray()` | Extract `ArrayBuffer` / typed array as `byte[]` |
-| `IsUndefined / IsNull / IsBool / IsNumber / IsString / …` | Type checks |
-| `PromiseState` | 0 = pending, 1 = fulfilled, 2 = rejected |
-| `ClassId` | Raw QuickJS class ID |
-| `Dispose()` | Free the JS value |
+| Member                                                    | Description                                          |
+| --------------------------------------------------------- | ---------------------------------------------------- |
+| `GetProp(name)`                                           | Get property by string name                          |
+| `GetProp(key)`                                            | Get property by symbol key                           |
+| `SetProp(name, value)`                                    | Set property by string name                          |
+| `SetProp(key, value)`                                     | Set property by symbol key                           |
+| `DefineProp(name, value, …)`                              | Define property with explicit descriptor flags       |
+| `Keys()`                                                  | Enumerable own string property names                 |
+| `GetOwnPropertyNames()`                                   | All own string property names (incl. non-enumerable) |
+| `GetOwnPropertyKeys()`                                    | All own keys including symbols (`Reflect.ownKeys()`) |
+| `GetOwnPropertyDescriptor(key)`                           | Property descriptor without invoking getters         |
+| `HasOwnProperty(name)`                                    | `Object.prototype.hasOwnProperty`                    |
+| `PropertyIsEnumerable(name)`                              | `Object.prototype.propertyIsEnumerable`              |
+| `GetPrototypeOf()`                                        | Get the prototype                                    |
+| `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free)                    |
+| `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free)                   |
+| `Dup()`                                                   | Duplicate (increment refcount)                       |
+| `ToNumber()`                                              | Extract as `double`                                  |
+| `ToInt64()`                                               | Extract BigInt as `long`                             |
+| `ToManagedString()`                                       | Extract as `string`                                  |
+| `ToByteArray()`                                           | Extract `ArrayBuffer` / typed array as `byte[]`      |
+| `IsUndefined / IsNull / IsBool / IsNumber / IsString / …` | Type checks                                          |
+| `PromiseState`                                            | 0 = pending, 1 = fulfilled, 2 = rejected             |
+| `ClassId`                                                 | Raw QuickJS class ID                                 |
+| `Dispose()`                                               | Free the JS value                                    |
 
 ### `QuickJsOptions`
 
-| Property | Type | Default | Description |
-|----------|------|---------|-------------|
-| `WasmBytes` | `byte[]?` | embedded binary | Raw WASM bytes |
-| `MemoryLimit` | `long?` | unlimited | Max JS heap in bytes |
-| `MaxStackSize` | `long?` | engine default | Max call stack in bytes |
-| `InterruptHandler` | `Func<bool>?` | none | Return `true` to interrupt |
-| `OnUnhandledRejection` | `Action<…>?` | none | Unhandled promise rejection hook |
-| `ModuleLoader` | `ModuleLoaderOptions?` | none | ES module loader |
-| `TimezoneOffset` | `TimezoneOffsetOption?` | `Host` | Timezone for `Date` |
-| `Intrinsics` | `int?` | `Intrinsics.ALL` | Bitmask of enabled intrinsics |
+| Property               | Type                    | Default          | Description                      |
+| ---------------------- | ----------------------- | ---------------- | -------------------------------- |
+| `WasmBytes`            | `byte[]?`               | embedded binary  | Raw WASM bytes                   |
+| `MemoryLimit`          | `long?`                 | unlimited        | Max JS heap in bytes             |
+| `MaxStackSize`         | `long?`                 | engine default   | Max call stack in bytes          |
+| `InterruptHandler`     | `Func<bool>?`           | none             | Return `true` to interrupt       |
+| `OnUnhandledRejection` | `Action<…>?`            | none             | Unhandled promise rejection hook |
+| `ModuleLoader`         | `ModuleLoaderOptions?`  | none             | ES module loader                 |
+| `TimezoneOffset`       | `TimezoneOffsetOption?` | `Host`           | Timezone for `Date`              |
+| `Intrinsics`           | `int?`                  | `Intrinsics.ALL` | Bitmask of enabled intrinsics    |
 
 ### Constant classes
 
-| Class | Purpose |
-|-------|---------|
-| `Intrinsics` | Bitmask flags for `QuickJsOptions.Intrinsics` |
-| `EvalFlags` | Flags for `QuickJs.Eval` (e.g., `TYPE_MODULE`, `ASYNC`) |
+| Class          | Purpose                                                     |
+| -------------- | ----------------------------------------------------------- |
+| `Intrinsics`   | Bitmask flags for `QuickJsOptions.Intrinsics`               |
+| `EvalFlags`    | Flags for `QuickJs.Eval` (e.g., `TYPE_MODULE`, `ASYNC`)     |
 | `CompileFlags` | Flags for `QuickJs.Compile` (`STRIP_SOURCE`, `STRIP_DEBUG`) |
 
 ---
@@ -1107,10 +1112,10 @@ mkdir -p src/dotnet/QuickJsWasi/Resources
 cp quickjs.wasm src/dotnet/QuickJsWasi/Resources/quickjs.wasm
 
 # 3. Build the .NET solution
-dotnet build src/dotnet/QuickJsWasi.sln
+dotnet build src/dotnet/QuickJsWasi.slnx
 
-# 4. Run tests (all 8 should pass)
-dotnet test src/dotnet/QuickJsWasi.sln
+# 4. Run tests
+dotnet test src/dotnet/QuickJsWasi.slnx
 
 # 5. Pack the NuGet package
 dotnet pack src/dotnet/QuickJsWasi/QuickJsWasi.csproj -c Release -o nupkg/
@@ -1122,19 +1127,23 @@ Tests skip gracefully when `quickjs.wasm` is absent (the binary is git-ignored),
 
 ## API deviations from the TypeScript implementation
 
-| TypeScript | .NET | Notes |
-|---|---|---|
-| `undefined` host value | `QuickJs.Undefined` sentinel | JS `undefined` → C# `QuickJs.Undefined`, not C# `null`. C# `null` → JS `null`. |
-| `Symbol` | `JsSymbol` record | Global symbols marshal as `new JsSymbol(description, isGlobal: true)`; local symbols → `QuickJs.Undefined`. |
-| `bigint` | `long` / `BigInteger` | `Dump` returns `long`; `HostToHandle` accepts `long` or `BigInteger`. |
-| `async create()` | `Task<QuickJs> CreateAsync()` | Returns a completed task; async signature kept for compatibility. |
-| `resolvePromise()` → `Promise<{value}\|{error}>` | `ResolvePromise()` → `Task<JSPromiseResult>` | `JSPromiseResult` is a discriminated union. |
-| `versions` includes npm package version | `Versions` includes engine version only | No equivalent of the npm package version in .NET. |
-| `hostToHandle(Promise)` wraps host promises | Not supported | .NET `Task` cannot be synchronously awaited inside the WASM call stack; use `NewPromise()` + `Deferred`. |
-| Extensions | Not supported | Dynamic WASM module composition via Wasmtime .NET SDK is not available. Snapshots with extensions cannot be restored. |
+| TypeScript                                       | .NET                                         | Notes                                                                                                                 |
+| ------------------------------------------------ | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `undefined` host value                           | `QuickJs.Undefined` sentinel                 | JS `undefined` → C# `QuickJs.Undefined`, not C# `null`. C# `null` → JS `null`.                                        |
+| `Symbol`                                         | `JsSymbol` record                            | Global symbols marshal as `new JsSymbol(description, isGlobal: true)`; local symbols → `QuickJs.Undefined`.           |
+| `bigint`                                         | `long` / `BigInteger`                        | `Dump` returns `long`; `HostToHandle` accepts `long` or `BigInteger`.                                                 |
+| `async create()`                                 | `Task<QuickJs> CreateAsync()`                | Returns a completed task; async signature kept for compatibility.                                                     |
+| `resolvePromise()` → `Promise<{value}\|{error}>` | `ResolvePromise()` → `Task<JSPromiseResult>` | `JSPromiseResult` is a discriminated union.                                                                           |
+| `versions` includes npm package version          | `Versions` includes engine version only      | No equivalent of the npm package version in .NET.                                                                     |
+| `hostToHandle(Promise)` wraps host promises      | Not supported                                | .NET `Task` cannot be synchronously awaited inside the WASM call stack; use `NewPromise()` + `Deferred`.              |
+| Extensions                                       | Not supported                                | Dynamic WASM module composition via Wasmtime .NET SDK is not available. Snapshots with extensions cannot be restored. |
 
 ## Packages used
 
 - `Wasmtime` 44.0.0 (pinned, not floating)
 - `xunit` 2.6.6 (tests only)
 - `Microsoft.NET.Test.Sdk` 17.8.0 (tests only)
+
+# Credits
+
+This project was port and rewrite from [vercelabs/quickjs-wasi](https://github.com/vercel-labs/quickjs-wasi)

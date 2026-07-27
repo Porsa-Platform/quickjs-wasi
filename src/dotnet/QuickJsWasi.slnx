@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="QuickJsWasi/QuickJsWasi.csproj" />
+  <Project Path="QuickJsWasi.Tests/QuickJsWasi.Tests.csproj" />
+  <Project Path="QuickJsWasi.Benchmarks/QuickJsWasi.Benchmarks.csproj" />
+</Solution>
