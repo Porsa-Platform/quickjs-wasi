@@ -7,7 +7,7 @@
 
     <!-- NuGet package metadata -->
     <PackageId>QuickJsWasi</PackageId>
-    <VersionPrefix>1.0.0</VersionPrefix>
+    <VersionPrefix>1.1.1</VersionPrefix>
     <Authors>Porsa Platform</Authors>
     <Description>Snapshotable JavaScript runtime for .NET via WebAssembly. QuickJS-NG compiled to a WASI reactor with snapshot/restore support, ES module loading, host functions, and a clean C# API.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>

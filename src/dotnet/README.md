@@ -1146,4 +1146,4 @@ Tests skip gracefully when `quickjs.wasm` is absent (the binary is git-ignored),
 
 # Credits
 
-This project was port and rewrite from [vercelabs/quickjs-wasi](https://github.com/vercel-labs/quickjs-wasi)
+This project is a port and rewrite from [vercelabs/quickjs-wasi](https://github.com/vercel-labs/quickjs-wasi)
