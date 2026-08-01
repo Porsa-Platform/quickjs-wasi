@@ -17,7 +17,9 @@ internal sealed class HostCallDispatcher
         var name = WasmMemoryAccessor.ReadUtf8(memory, namePtr, nameLen);
         if (!_vm.TryGetHostCallback(name, out var callback))
         {
-            return _vm.Exports.DupValue(_vm.UndefinedValue.Ptr);
+            using var err = _vm.NewError(new InvalidOperationException($"Host callback '{name}' is not registered."));
+            _vm.Exports.Throw(err.Ptr);
+            return 0;
         }
 
         using var thisHandle = new JSValueHandle(_vm, thisPtr, ownsValue: false);
