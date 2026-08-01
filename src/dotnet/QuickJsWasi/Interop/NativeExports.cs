@@ -119,6 +119,7 @@ internal sealed class NativeExports
     public int GetPrototypeOf(int objPtr) => Convert.ToInt32(Call("qjs_get_prototype_of", objPtr)!);
     public int GetValuePtr(int valuePtr) => Convert.ToInt32(Call("qjs_get_value_ptr", valuePtr)!);
     public int Call(int funcPtr, int thisPtr, int argc, int argvPtr) => Convert.ToInt32(Call("qjs_call", funcPtr, thisPtr, argc, argvPtr)!);
+    public int CallConstructor(int ctorPtr, int argc, int argvPtr) => Convert.ToInt32(Call("qjs_call_constructor", ctorPtr, argc, argvPtr)!);
     public int NewHostFunction(int namePtr, int nameLen, int argCount) => Convert.ToInt32(Call("qjs_new_host_function", namePtr, nameLen, argCount)!);
     public int NewPromise(int resolveOutPtr, int rejectOutPtr) => Convert.ToInt32(Call("qjs_new_promise", resolveOutPtr, rejectOutPtr)!);
     public int PromiseState(int promisePtr) => Convert.ToInt32(Call("qjs_promise_state", promisePtr)!);

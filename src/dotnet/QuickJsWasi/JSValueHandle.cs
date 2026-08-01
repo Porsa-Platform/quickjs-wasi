@@ -8,17 +8,34 @@ public sealed class JSValueHandle : IDisposable
     private readonly bool _isSingleton;
     private bool _disposed;
 
+    /// <summary>
+    /// Extra cleanup to run when this handle is disposed — used by
+    /// <see cref="QuickJs.NewEphemeralFunction"/> to unregister its host callback.
+    /// </summary>
+    internal Action? _onDispose;
+
     internal JSValueHandle(QuickJs vm, int ptr, bool ownsValue = true, bool isSingleton = false)
     {
         Vm = vm;
         Ptr = ptr;
         _ownsValue = ownsValue;
         _isSingleton = isSingleton;
+        // Singletons are shared and outlive any scope.
+        if (!isSingleton) vm._activeScope?.Add(this);
     }
 
     public QuickJs Vm { get; }
 
     public int Ptr { get; }
+
+    /// <summary>
+    /// Whether <see cref="Dispose"/> has been called on this handle.
+    ///
+    /// Note that handle methods do not guard against use-after-disposal — reading
+    /// from a disposed handle reads freed memory. Check this when a handle's
+    /// lifetime is managed elsewhere (e.g. by <see cref="QuickJs.WithScope{T}"/>).
+    /// </summary>
+    public bool Disposed => _disposed;
 
     public bool IsException => Vm.Exports.IsException(Ptr) != 0;
     public bool IsUndefined => Vm.Exports.IsUndefined(Ptr) != 0;
@@ -254,7 +271,27 @@ public sealed class JSValueHandle : IDisposable
     public JSValueHandle GetProxyTarget() => new(Vm, Vm.Exports.GetProxyTarget(Ptr));
     public JSValueHandle GetProxyHandler() => new(Vm, Vm.Exports.GetProxyHandler(Ptr));
     public double ToNumber() => Vm.Exports.GetFloat64(Ptr);
-    public bool ToBool() => Vm.Exports.GetBool(Ptr) != 0;
+    public bool ToBool() => ToBoolean();
+
+    /// <summary>
+    /// Extract the value as a boolean, applying JavaScript truthiness
+    /// (equivalent to <c>!!value</c> inside the VM).
+    /// </summary>
+    public bool ToBoolean() => Vm.Exports.GetBool(Ptr) != 0;
+
+    /// <summary>
+    /// A numeric identity for the underlying heap value, or <c>0</c> for values
+    /// that are not heap-allocated (numbers, booleans, <c>null</c>, <c>undefined</c>).
+    ///
+    /// Two handles to the same underlying object always report the same identity;
+    /// two live handles to different objects always report different identities.
+    /// This is the value to key a <see cref="Dictionary{TKey,TValue}"/> on when
+    /// deduplicating or detecting cycles across handles.
+    ///
+    /// The identity is only meaningful while the value is alive; it is an address
+    /// and may be reused after every handle to the value has been disposed.
+    /// </summary>
+    public int Identity => Vm.Exports.GetValuePtr(Ptr);
 
     public long ToInt64()
     {
@@ -361,6 +398,8 @@ public sealed class JSValueHandle : IDisposable
         }
 
         _disposed = true;
+        _onDispose?.Invoke();
+        _onDispose = null;
         if (!Vm.IsDisposed && Ptr != 0)
         {
             Vm.Exports.FreeValue(Ptr);

@@ -20,6 +20,16 @@ public sealed class QuickJs : IDisposable
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
     private readonly WasiShim _wasi;
     private bool _disposed;
+    private int _nextInternalId;
+
+    /// <summary>
+    /// The innermost active <see cref="WithScope{T}"/> batch, if any.
+    /// Non-singleton handles register themselves here on construction.
+    /// </summary>
+    internal HashSet<JSValueHandle>? _activeScope;
+
+    /// <summary><c>Promise.prototype.then</c>, captured on first use.</summary>
+    private JSValueHandle? _promiseThen;
 
     private QuickJs(Engine engine, Wasmtime.Module module, Store store, Linker linker, WasiShim wasi)
     {
@@ -487,12 +497,39 @@ public sealed class QuickJs : IDisposable
         var onRejectedHandle = new JSValueHandle(this, Exports.NewHostFunction(rejectedWritten.Ptr, rejectedWritten.Length, 1));
         Exports.WasmFree(rejectedWritten.Ptr);
 
-        using var thenFn = promise.GetProp("then");
-        CallFunctionRaw(thenFn, promise, onFulfilledHandle, onRejectedHandle).Dispose();
+        // Use the captured intrinsic rather than reading `.then` off the value:
+        // a proxy or a patched own property would otherwise run guest code here.
+        CallFunctionRaw(GetPromiseThen(), promise, onFulfilledHandle, onRejectedHandle).Dispose();
         onFulfilledHandle.Dispose();
         onRejectedHandle.Dispose();
 
         return tcs.Task;
+    }
+
+    /// <summary>
+    /// <c>Promise.prototype.then</c>, captured once and reused.
+    ///
+    /// <see cref="ResolvePromise"/> needs to subscribe to a promise without executing
+    /// guest code, so it must not read <c>.then</c> off the value being resolved.
+    /// </summary>
+    internal JSValueHandle GetPromiseThen()
+    {
+        if (_promiseThen is null)
+        {
+            // Capture outside any active scope, since this outlives it.
+            var enclosing = _activeScope;
+            _activeScope = null;
+            try
+            {
+                _promiseThen = Eval("Promise.prototype.then");
+            }
+            finally
+            {
+                _activeScope = enclosing;
+            }
+        }
+
+        return _promiseThen;
     }
 
     public JSValueHandle NewString(string value)
@@ -617,6 +654,144 @@ public sealed class QuickJs : IDisposable
     public JSValueHandle CallFunction(JSValueHandle func, JSValueHandle thisValue, params JSValueHandle[] args)
         => ThrowIfException(CallFunctionRaw(func, thisValue, args));
 
+    /// <summary>
+    /// Invoke a QuickJS constructor with <c>new</c>, i.e. <c>new ctor(...args)</c>.
+    /// If the constructor throws — including when <paramref name="ctor"/> is not a
+    /// constructor — a <see cref="JSException"/> is thrown on the host side.
+    ///
+    /// This is the counterpart to <see cref="CallFunction"/> for building values
+    /// inside the VM from the host, e.g. <c>new Date(iso)</c> on a constructor
+    /// captured before any user code ran.
+    /// </summary>
+    public JSValueHandle Construct(JSValueHandle ctor, params JSValueHandle[] args)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+        ArgumentNullException.ThrowIfNull(ctor);
+
+        var argvPtr = 0;
+        if (args.Length > 0)
+        {
+            argvPtr = Exports.WasmMalloc(args.Length * 4);
+            for (var i = 0; i < args.Length; i++)
+            {
+                WasmMemoryAccessor.WriteInt32(Exports.Memory, argvPtr + (i * 4), args[i].Ptr);
+            }
+        }
+
+        try
+        {
+            return ThrowIfException(new JSValueHandle(this, Exports.CallConstructor(ctor.Ptr, args.Length, argvPtr)));
+        }
+        finally
+        {
+            if (argvPtr != 0) Exports.WasmFree(argvPtr);
+        }
+    }
+
+    /// <summary>
+    /// Run <paramref name="fn"/> with a handle scope: every handle created during
+    /// the call is disposed when it returns, except those passed to
+    /// <see cref="IHandleScope.Escape"/>.
+    ///
+    /// <para>
+    /// This is the bulk alternative to disposing handles individually, for code
+    /// that creates many intermediates — walking a large value tree, for example:
+    /// </para>
+    /// <code>
+    /// var name = vm.WithScope(scope =&gt;
+    /// {
+    ///     var user    = root.GetProp("user");    // freed automatically
+    ///     var profile = user.GetProp("profile"); // freed automatically
+    ///     return scope.Escape(profile.GetProp("name"));
+    /// });
+    /// </code>
+    ///
+    /// <para>
+    /// Scopes nest: <see cref="IHandleScope.Escape"/> transfers the handle to the
+    /// enclosing scope when there is one, so it is still cleaned up at the outer
+    /// boundary.
+    /// </para>
+    ///
+    /// <para>
+    /// <paramref name="fn"/> must be synchronous. Handles created after an
+    /// <c>await</c> would be outside the scope, because it closes as soon as
+    /// <paramref name="fn"/> returns.
+    /// </para>
+    /// </summary>
+    public T WithScope<T>(Func<IHandleScope, T> fn)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+        ArgumentNullException.ThrowIfNull(fn);
+
+        var enclosing = _activeScope;
+        var tracked = new HashSet<JSValueHandle>();
+        _activeScope = tracked;
+
+        var scope = new HandleScopeImpl(tracked, enclosing);
+        try
+        {
+            return fn(scope);
+        }
+        finally
+        {
+            _activeScope = enclosing;
+            foreach (var handle in tracked)
+                handle.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Create a QuickJS function backed by a host callback whose registration is
+    /// tied to the returned handle: disposing the handle unregisters the callback.
+    ///
+    /// <para>
+    /// Use this for short-lived callbacks — e.g. a visitor passed to
+    /// <c>Map.prototype.forEach</c> — where the name is an implementation detail.
+    /// <see cref="NewHostFunction"/> keeps its callback registered for the lifetime
+    /// of the VM (by design, so that names can be re-registered after a snapshot is
+    /// restored), which makes it unsuitable for callbacks created in a loop.
+    /// </para>
+    ///
+    /// <para>
+    /// The guest must not retain the function past disposal: calling it after
+    /// the handle is disposed throws, because the callback is gone. Ephemeral
+    /// functions do not survive snapshot/restore.
+    /// </para>
+    /// </summary>
+    public JSValueHandle NewEphemeralFunction(HostFunction fn)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+        ArgumentNullException.ThrowIfNull(fn);
+
+        var name = $"__ephemeral:{_nextInternalId++}";
+        _hostCallbacks[name] = fn;
+
+        var written = WriteString(name);
+        var resultPtr = Exports.NewHostFunction(written.Ptr, written.Length, 0);
+        Exports.WasmFree(written.Ptr);
+
+        var handle = new JSValueHandle(this, resultPtr);
+        handle._onDispose = () =>
+        {
+            if (!_disposed) _hostCallbacks.Remove(name);
+        };
+        return handle;
+    }
+
+    /// <summary>
+    /// Remove a host callback registered with <see cref="NewHostFunction"/> or
+    /// <see cref="RegisterHostCallback"/>. Returns <c>true</c> if a callback was
+    /// removed.
+    ///
+    /// Any QuickJS function still referencing the name will throw when called,
+    /// so only unregister once the guest can no longer reach it.
+    /// </summary>
+    public bool UnregisterHostCallback(string name)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        return _hostCallbacks.Remove(name);
+    }
+
     public object? Dump(JSValueHandle handle) => ValueMarshalling.Dump(this, handle);
 
     public JSValueHandle HostToHandle(object? value) => ValueMarshalling.HostToHandle(this, value);
@@ -704,6 +879,8 @@ public sealed class QuickJs : IDisposable
         }
 
         _disposed = true;
+        _activeScope = null;
+        _promiseThen = null;
 
         // NB: Do NOT call Exports.Destroy() here. The C-side qjs_destroy calls
         // JS_FreeContext which leaves the runtime with a non-empty gc_obj_list.
@@ -723,5 +900,24 @@ public sealed class QuickJs : IDisposable
         _linker.Dispose();
         _module.Dispose();
         _engine.Dispose();
+    }
+
+    private sealed class HandleScopeImpl : IHandleScope
+    {
+        private readonly HashSet<JSValueHandle> _tracked;
+        private readonly HashSet<JSValueHandle>? _enclosing;
+
+        public HandleScopeImpl(HashSet<JSValueHandle> tracked, HashSet<JSValueHandle>? enclosing)
+        {
+            _tracked = tracked;
+            _enclosing = enclosing;
+        }
+
+        public JSValueHandle Escape(JSValueHandle handle)
+        {
+            _tracked.Remove(handle);
+            _enclosing?.Add(handle);
+            return handle;
+        }
     }
 }
