@@ -1,5 +1,47 @@
 # quickjs-wasi
 
+## 3.6.0
+
+### Minor Changes
+
+- [#44](https://github.com/vercel-labs/quickjs-wasi/pull/44) [`28e4b60`](https://github.com/vercel-labs/quickjs-wasi/commit/28e4b6006ff04fdae98fb31e7c44e162f2e9d9ca) Thanks [@aayush-kapoor](https://github.com/aayush-kapoor)! - Add the `maxStackSize` option and `MAX_STACK_SIZE` ceiling so WASI stack
+  overflow can be caught by guest JavaScript without exhausting the physical
+  WebAssembly stack.
+
+## 3.5.0
+
+### Minor Changes
+
+- [#41](https://github.com/vercel-labs/quickjs-wasi/pull/41) [`a60119c`](https://github.com/vercel-labs/quickjs-wasi/commit/a60119c738ef837ba7398128babb568c68873152) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Add `handle.className`: the engine-level class name of a value (e.g. `"Map"`, `"Date"`, `"URL"`) read trap-free from the class table — unlike `constructorName`, it executes no guest code and cannot be spoofed by prototype/constructor reassignment.
+
+- [#41](https://github.com/vercel-labs/quickjs-wasi/pull/41) [`a60119c`](https://github.com/vercel-labs/quickjs-wasi/commit/a60119c738ef837ba7398128babb568c68873152) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Add `vm.markPromiseHandled(promise)`: suppress the `onUnhandledRejection` callback for a promise whose rejection the host observes through other means.
+
+- [#41](https://github.com/vercel-labs/quickjs-wasi/pull/41) [`a60119c`](https://github.com/vercel-labs/quickjs-wasi/commit/a60119c738ef837ba7398128babb568c68873152) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Update quickjs-ng from v0.15.1 to v0.16.2: brings the iterator chunking/includes/join proposals, the `Error.prototype.stack` accessor proposal, a faster register-based regexp engine, a new arena allocator, and many correctness/security fixes.
+
+### Patch Changes
+
+- [#41](https://github.com/vercel-labs/quickjs-wasi/pull/41) [`a60119c`](https://github.com/vercel-labs/quickjs-wasi/commit/a60119c738ef837ba7398128babb568c68873152) Thanks [@TooTallNate](https://github.com/TooTallNate)! - `resolvePromise()`, `Deferred.settled`, and module namespace resolution now subscribe via quickjs-ng's engine-level `JS_PromiseThen` instead of a captured `Promise.prototype.then`, so guest code that patches `then` or `Symbol.species` can no longer intercept or observe host promise subscriptions.
+
+- [#39](https://github.com/vercel-labs/quickjs-wasi/pull/39) [`8becfe0`](https://github.com/vercel-labs/quickjs-wasi/commit/8becfe05556d103138b8bd2344ab64f66fa83600) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Exceeding `memoryLimit` throws `InternalError: out of memory` again instead of a bare `null` (regression in 3.3.1): the limit is now enforced in the WASI malloc layer, which reserves headroom below the limit so the OOM error object can always be constructed.
+
+## 3.4.0
+
+### Minor Changes
+
+- [#35](https://github.com/vercel-labs/quickjs-wasi/pull/35) [`0b05c98`](https://github.com/vercel-labs/quickjs-wasi/commit/0b05c983938c70d4b7398116bf781bf9085963a2) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Strings now cross the WASM boundary losslessly in both directions — embedded NULs and lone surrogates survive `toString()`, `newString()`, `evalCode()` sources, property keys, and enumeration.
+
+- [#36](https://github.com/vercel-labs/quickjs-wasi/pull/36) [`61eb90f`](https://github.com/vercel-labs/quickjs-wasi/commit/61eb90fb346f1d6172049b2bf42190bb8859dc9c) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Add `vm.exportHandle()` / `vm.importHandle()` for snapshot-portable handle tokens, enabling pre-snapshot captures to be re-materialized in restored VMs without executing guest code.
+
+## 3.3.1
+
+### Patch Changes
+
+- [#31](https://github.com/vercel-labs/quickjs-wasi/pull/31) [`ff79f5c`](https://github.com/vercel-labs/quickjs-wasi/commit/ff79f5cc7f48c68bf0b36292f6a5545f516dd084) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Host-callback `this`/argument handles are now "borrowed": exempt from `withScope()` tracking and `dispose()` is a no-op. Their pointers are owned by the C trampoline (which frees them after the call returns), so a scope active around guest execution — or an explicit dispose inside a callback — previously double-freed the guest values and corrupted the heap. Callbacks retain arguments past their invocation via `dup()`, which takes an owned reference and behaves normally.
+
+- [#34](https://github.com/vercel-labs/quickjs-wasi/pull/34) [`fca5918`](https://github.com/vercel-labs/quickjs-wasi/commit/fca5918bd52ff56f144e7f1ac6ed7c3f327f24aa) Thanks [@TooTallNate](https://github.com/TooTallNate)! - Calling a guest function whose host callback is not registered now throws inside the guest (catchable, or surfaced as a host exception when uncaught), as the `newEphemeralFunction` and `unregisterHostCallback` docs already promised — previously it silently returned `undefined`, masking bugs like un-re-registered callbacks after a snapshot restore.
+
+- [#33](https://github.com/vercel-labs/quickjs-wasi/pull/33) [`4829774`](https://github.com/vercel-labs/quickjs-wasi/commit/4829774bd667965c9f713db2f081484ac41bd66e) Thanks [@TooTallNate](https://github.com/TooTallNate)! - `memoryLimit` now actually bounds retained memory: the runtime is created with malloc functions that use wasi-libc's `malloc_usable_size`, replacing quickjs-ng's default usable-size which returns 0 on wasm32-wasi. Previously every allocation was accounted as overhead only, so retained ArrayBuffers/TypedArrays (and all other allocations) grew real memory without bound under any limit — reaching GiB under an 8 MiB `memoryLimit` — and `getMemoryUsage().mallocSize` stayed near zero. Workloads near their configured limit may now throw where they silently over-allocated before; raise `memoryLimit` to match actual usage.
+
 ## 3.3.0
 
 ### Minor Changes

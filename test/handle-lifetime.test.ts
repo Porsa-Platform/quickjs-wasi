@@ -24,10 +24,28 @@ describe('newEphemeralFunction', () => {
 
     fn.dispose();
 
-    // the guest still holds the function, but the callback is gone: an
-    // unregistered host callback yields `undefined` rather than throwing
-    using after = vm.evalCode('ephemeral()');
-    expect(after.isUndefined).toBe(true);
+    // The guest still holds the function, but the callback is gone: the
+    // call throws inside the guest (as the newEphemeralFunction docs
+    // promise), and the error is catchable like any other guest error.
+    using after = vm.evalCode(
+      'try { ephemeral(); "no-throw" } catch (e) { e.message }'
+    );
+    expect(after.toString()).toContain('is not registered');
+  });
+
+  it('a call after unregisterHostCallback throws inside the guest', async () => {
+    using vm = await QuickJS.create(wasmBytes);
+
+    using fn = vm.newFunction('goner', () => vm.newString('alive'));
+    vm.setProp(vm.global, 'goner', fn);
+    expect(vm.evalCode('goner()').consume((h) => h.toString())).toBe('alive');
+
+    expect(vm.unregisterHostCallback('goner')).toBe(true);
+
+    // Uncaught in the guest: surfaces as a host-side exception.
+    expect(() => vm.evalCode('goner()')).toThrow(
+      '"goner" is not registered'
+    );
   });
 
   it('does not leak callbacks across many calls', async () => {
@@ -67,8 +85,12 @@ describe('unregisterHostCallback', () => {
 
     expect(vm.unregisterHostCallback('greet')).toBe(true);
     expect(vm.unregisterHostCallback('greet')).toBe(false);
-    using after = vm.evalCode('greet()');
-    expect(after.isUndefined).toBe(true);
+    // A call through the still-reachable guest function now throws, as
+    // the unregisterHostCallback docs promise.
+    using after = vm.evalCode(
+      'try { greet(); "no-throw" } catch (e) { e.message }'
+    );
+    expect(after.toString()).toContain('"greet" is not registered');
   });
 
   it('frees the name for reuse', async () => {
@@ -83,6 +105,83 @@ describe('unregisterHostCallback', () => {
     vm.unregisterHostCallback('reused');
     using second = vm.newFunction('reused', () => vm.newNumber(2));
     expect(vm.callFunction(second, vm.undefined).consume((h) => h.toNumber())).toBe(2);
+  });
+});
+
+describe('withScope + host callbacks (borrowed handles)', () => {
+  it('does not free host-callback argument handles at scope exit', async () => {
+    using vm = await QuickJS.create(wasmBytes);
+
+    // Regression: the trampoline's `this`/argument handles wrap pointers
+    // OWNED BY THE C CALLER. Before the `borrowed` flag they registered
+    // with the active scope, and the scope's disposal at exit double-freed
+    // the guest values, observed as WASM memory corruption when a host
+    // serializer drove Map/Set `forEach` visitors inside `withScope`.
+    const seen: number[] = [];
+    using visitor = vm.newEphemeralFunction((value) => {
+      seen.push(value.toNumber());
+      return vm.undefined;
+    });
+    vm.setProp(vm.global, 'visit', visitor);
+
+    using guestMap = vm.evalCode('new Map([["a", 1], ["b", 2], ["c", 3]])');
+
+    vm.withScope(() => {
+      using forEach = vm.evalCode('Map.prototype.forEach');
+      vm.callFunction(forEach, guestMap, visitor).dispose();
+    });
+
+    expect(seen).toEqual([1, 2, 3]);
+
+    // The guest heap must still be intact: the map's values were the
+    // callback's argument pointers, which a buggy scope would have freed.
+    // Re-read the original map through the guest to prove they survived
+    // the scope exit.
+    vm.setProp(vm.global, 'm', guestMap);
+    using sum = vm.evalCode(
+      '(() => { let s = 0; for (const v of m.values()) s += v; return s; })()'
+    );
+    expect(sum.toNumber()).toBe(6);
+  });
+
+  it('explicit dispose() of a borrowed argument handle is a no-op', async () => {
+    using vm = await QuickJS.create(wasmBytes);
+
+    using fn = vm.newEphemeralFunction((value, other) => {
+      // A callback must not be able to free the C caller's values.
+      value.dispose();
+      other.dispose();
+      expect(value.disposed).toBe(false);
+      expect(other.disposed).toBe(false);
+      return vm.undefined;
+    });
+    vm.setProp(vm.global, 'cb', fn);
+    vm.evalCode('cb("shared", { n: 1 })').dispose();
+
+    // Guest strings/objects passed as args must remain readable.
+    using still = vm.evalCode('"shared".length');
+    expect(still.toNumber()).toBe(6);
+  });
+
+  it('dup() of a borrowed argument survives past the callback and the scope', async () => {
+    using vm = await QuickJS.create(wasmBytes);
+
+    let retained: ReturnType<typeof vm.newObject> | undefined;
+    using fn = vm.newEphemeralFunction((value) => {
+      retained = value.dup();
+      return vm.undefined;
+    });
+    vm.setProp(vm.global, 'keep', fn);
+
+    vm.withScope(() => {
+      vm.evalCode('keep({ tag: "kept" })').dispose();
+      // The dup was created inside the scope and IS scope-tracked.
+      expect(retained!.disposed).toBe(false);
+    });
+
+    // The dup is an owned reference: the scope disposed it at exit,
+    // exactly like any handle the callback created.
+    expect(retained!.disposed).toBe(true);
   });
 });
 
