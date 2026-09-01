@@ -104,6 +104,9 @@ public sealed class PortableHandleTests : TestBase
 
         InvalidOperationException? thrown = null;
         int? dupToken = null;
+        // Kept alive outside the lambda so the exported token stays valid
+        // until ImportHandle is called below.
+        JSValueHandle? ownedForExport = null;
 
         using var fn = vm.NewEphemeralFunction((_, args) =>
         {
@@ -118,8 +121,10 @@ public sealed class PortableHandleTests : TestBase
             }
 
             // The documented escape hatch: dup() gives an owned handle.
-            using var owned = args[0].Dup();
-            dupToken = vm.ExportHandle(owned);
+            // Do NOT use `using` here — the handle must outlive the callback
+            // so the token remains valid when ImportHandle is called.
+            ownedForExport = args[0].Dup();
+            dupToken = vm.ExportHandle(ownedForExport);
             return vm.UndefinedValue;
         });
 
@@ -133,6 +138,8 @@ public sealed class PortableHandleTests : TestBase
         using var imported = vm.ImportHandle(dupToken!.Value);
         using var n = imported.GetProp("n");
         Assert.Equal(3, (int)n.ToNumber());
+
+        ownedForExport?.Dispose();
     }
 
     [Fact]
