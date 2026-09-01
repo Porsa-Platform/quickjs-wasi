@@ -1,3 +1,8 @@
+# .NET QuickjsWasi
+
+This repo is a port of the [QuickJS Wasi from vercel labs](https://github.com/vercel-labs/quickjs-wasi) to dotnet. This readme is kept for parity check purposes, as this repo is evolving at the same rate as its original typescript counter part. You can find the dotnet read me [here](src/dotnet)
+
+--------------------------------------------------------------------------------
 # quickjs-wasi
 
 A snapshotable JavaScript runtime via WebAssembly. Runs [QuickJS](https://github.com/quickjs-ng/quickjs) compiled to WASM, with the ability to **snapshot the entire VM state** (including pending promises) and **restore it in a fresh WASM instance**.
