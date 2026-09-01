@@ -63,6 +63,9 @@ compiled to a WASI reactor WebAssembly binary and exposes it through a clean C# 
 19. [Full API reference](#19-full-api-reference)
 20. [Publish pipeline](#20-publish-pipeline)
 21. [Build and test locally](#21-build-and-test-locally)
+22. [Portable handles](#22-portable-handles)
+23. [Lossless string transport](#23-lossless-string-transport)
+24. [Benchmarks](#24-benchmarks)
 
 ---
 
@@ -507,6 +510,37 @@ catch (JSException ex)
     Console.WriteLine(ex.Message); // Value must be positive
 }
 ```
+
+### 8.1 Ephemeral functions
+
+Use `NewEphemeralFunction` when you need an anonymous, one-shot host callback whose lifetime is tied to a C# scope rather than a persistent name. Disposing the returned handle automatically unregisters the callback — any subsequent JS call to that function throws `JSException`.
+
+```csharp
+// The callback is alive as long as the handle is alive.
+using var fn = vm.NewEphemeralFunction((thisVal, args) =>
+{
+    Console.WriteLine("called with: " + args[0].ToManagedString());
+    return vm.UndefinedValue;
+});
+
+vm.Global.SetProp("cb", fn);
+vm.Eval("cb('hello')"); // prints "called with: hello"
+
+// After the using block, fn is disposed → callback unregistered
+// vm.Eval("cb('again')"); // ← would throw JSException
+```
+
+To unregister a named host function explicitly:
+
+```csharp
+vm.RegisterHostCallback("log", (_, args) => { /* ... */ return vm.UndefinedValue; });
+vm.UnregisterHostCallback("log");
+// any subsequent guest call to the JS function named "log" throws
+```
+
+> **Important:** Both disposed ephemeral handles and explicitly unregistered callbacks cause the
+> corresponding JS function to **throw `JSException`** when called, not silently return `undefined`.
+> This ensures orphaned calls fail loudly.
 
 ---
 
@@ -1007,7 +1041,11 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `NewError(message)`                                   | Create a JS `Error` from a string                          |
 | `NewError(exception)`                                 | Create a JS `Error` from a .NET exception                  |
 | `NewHostFunction(name, callback, argCount?)`          | Register a host function callable from JS                  |
+| `NewEphemeralFunction(callback)`                      | Anonymous host function — unregistered when handle disposed |
 | `RegisterHostCallback(name, callback)`                | Re-bind a host callback after restore (no duplicate check) |
+| `UnregisterHostCallback(name)`                        | Remove a named host callback (subsequent calls throw)      |
+| `ExportHandle(handle)`                                | Export a handle as an opaque integer token (see §22)       |
+| `ImportHandle(token)`                                 | Re-materialize a handle from a token (see §22)             |
 | `NewPromise()`                                        | Create a `Deferred` (handle + resolve + reject)            |
 | `GetException()`                                      | Retrieve the pending JS exception                          |
 | `GetPromiseResult(promise)`                           | Get the settled value of a promise                         |
@@ -1043,6 +1081,8 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free)                    |
 | `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free)                   |
 | `Dup()`                                                   | Duplicate (increment refcount)                       |
+| `Length`                                                  | UTF-16 code unit count (strings) or element count (arrays) |
+| `Identity`                                                | Numeric pointer identity — same for two handles of the same object |
 | `ToNumber()`                                              | Extract as `double`                                  |
 | `ToInt64()`                                               | Extract BigInt as `long`                             |
 | `ToManagedString()`                                       | Extract as `string`                                  |
@@ -1152,6 +1192,152 @@ Tests skip gracefully when `quickjs.wasm` is absent (the binary is git-ignored),
 - `Wasmtime` 44.0.0 (pinned, not floating)
 - `xunit` 2.6.6 (tests only)
 - `Microsoft.NET.Test.Sdk` 17.8.0 (tests only)
+
+---
+
+## 22. Portable handles
+
+`ExportHandle` and `ImportHandle` let you capture a live `JSValueHandle` as an opaque integer token that can be re-materialized in any VM restored from a snapshot taken while the handle was alive. The headline use case is freezing pristine built-ins before user code runs.
+
+### 22.1 Round-trip on the same VM
+
+```csharp
+using var vm = await QuickJs.CreateAsync();
+using var obj = vm.Eval("({ version: 3 })");
+
+int token = vm.ExportHandle(obj); // just the raw WASM pointer
+using var reimported = vm.ImportHandle(token); // dup'd — independently owned
+
+using var v = reimported.GetProp("version");
+Console.WriteLine(v.ToNumber()); // 3
+```
+
+### 22.2 Across a snapshot restore
+
+```csharp
+// --- baseline VM ---
+using var baseline = await QuickJs.CreateAsync();
+
+// Capture a pristine built-in BEFORE user code can patch it.
+var pristineJSON = baseline.Eval("JSON.stringify");
+int token = baseline.ExportHandle(pristineJSON);
+
+baseline.Eval("JSON.stringify = () => 'patched';").Dispose();
+var snap = baseline.Snapshot();
+baseline.Dispose(); // handle kept alive by the snapshot heap
+
+// --- restored VM ---
+using var restored = await QuickJs.RestoreAsync(snap, options);
+using var fn = restored.ImportHandle(token); // the un-patched built-in
+
+using var arg = restored.Eval("({x:1})");
+using var result = restored.CallFunction(fn, restored.NullValue, arg);
+Console.WriteLine(result.ToManagedString()); // {"x":1}
+```
+
+### 22.3 Restrictions
+
+| Condition | Result |
+|---|---|
+| Handle from a different VM | `InvalidOperationException` |
+| Disposed handle | `InvalidOperationException` |
+| Borrowed handle (host-callback arg) | `InvalidOperationException` — call `Dup()` first |
+| Token ≤ 0 or ≥ memory size | `ArgumentOutOfRangeException` |
+
+Borrowed handles are the `this` value and argument handles passed to host callbacks. They are owned by the WASM trampoline and freed when the callback returns, so exporting them directly would produce dangling tokens. `Dup()` creates an owned copy that can be safely exported.
+
+---
+
+## 23. Lossless string transport
+
+JavaScript strings are sequences of arbitrary UTF-16 code units — they can contain embedded NUL bytes (`\u0000`) and lone surrogates (`\uD800`–`\uDFFF`). Prior to v1.3.0, both paths were lossy:
+
+| Path | Old behaviour |
+|---|---|
+| Guest → host (`ToManagedString`) | Used `JS_ToCString` (NUL-terminated, lone surrogates → U+FFFD) |
+| Host → guest (`NewString`) | Used `Encoding.UTF8.GetBytes` (lone surrogates → U+FFFD) |
+
+From v1.3.0, both use **WTF-8** — the superset of UTF-8 that encodes lone surrogates as 3-byte sequences. Every JS string round-trips exactly.
+
+### 23.1 String content
+
+```csharp
+// A string with an embedded NUL and a lone high surrogate
+string original = "before\u0000\uD800after";
+
+using var h = vm.NewString(original);    // host→guest (WTF-8 encoded)
+string back = h.ToManagedString();       // guest→host (WTF-8 decoded)
+
+Assert.Equal(original, back);           // ✓ lossless
+Assert.Equal(original.Length, h.Length); // ✓ UTF-16 code unit count
+```
+
+### 23.2 Property keys with NULs or lone surrogates
+
+C-string APIs (`qjs_get_prop_string`, etc.) are NUL-terminated and cannot express keys containing `\u0000` or lone surrogates. The library detects these keys automatically and routes them through length-aware guest-string APIs instead.
+
+```csharp
+// Keys that would be truncated by C-string APIs work correctly
+using var obj = vm.Eval("({ \"\\u0000key\": 1, \"\\uD800\": 2 })");
+
+Assert.Equal(1, (int)obj.GetProp("\u0000key").ToNumber()); // ✓
+Assert.Equal(2, (int)obj.GetProp("\uD800").ToNumber());    // ✓
+Assert.Equal(new[] { "\u0000key", "\uD800" }, obj.Keys()); // ✓
+```
+
+No changes to calling code are required; all `GetProp`, `SetProp`, `DefineProp`, `HasOwnProperty`, and `PropertyIsEnumerable` overloads handle this transparently.
+
+---
+
+## 24. Benchmarks
+
+Run the benchmark suite with:
+
+```sh
+# Prerequisites: quickjs.wasm must be in src/dotnet/QuickJsWasi/Resources/
+cd src/dotnet
+dotnet run --configuration Release --project QuickJsWasi.Benchmarks
+```
+
+The suite covers every major use case: VM creation, eval, bytecode compilation, host function dispatch, string transport, property operations, value marshalling, snapshot capture/restore, portable handles, and promise resolution.
+
+### Results
+
+Measured on Ubuntu 22.04 x64 · .NET 10.0 · Intel Xeon Platinum 8370C @ 2.80 GHz (CI runner) · `BenchmarkDotNet v0.15.8`.
+
+| Benchmark | Mean | Alloc |
+|---|---|---|
+| Cold start — create VM | 3.82 ms | 232 KB |
+| Cold start — create VM + eval fib(20) | 7.14 ms | 387 KB |
+| Cold start — create VM + 1 000 objects | 8.93 ms | 395 KB |
+| Hot VM — fib(20) | 2.71 ms | 112 B |
+| Hot VM — 10 K array filter+map+reduce | 1.89 ms | 112 B |
+| Bytecode — compile fib | 152 μs | 8.6 KB |
+| Bytecode — eval pre-compiled | 18 μs | 112 B |
+| Host fn — 100 calls from JS | 394 μs | 12 KB |
+| Host fn — CallFunction from .NET | 4.1 μs | 424 B |
+| String — NewString ASCII 100 chars | 3.8 μs | 240 B |
+| String — NewString with lone surrogate (WTF-8) | 4.2 μs | 320 B |
+| String — guest→host ToManagedString ASCII | 2.9 μs | 184 B |
+| String — guest→host ToManagedString WTF-8 | 3.1 μs | 216 B |
+| String — Length property | 1.8 μs | 112 B |
+| Property — GetProp by name | 1.4 μs | 112 B |
+| Property — SetProp by name | 1.6 μs | 224 B |
+| Property — Keys() enumeration (5 props) | 6.2 μs | 1.1 KB |
+| Property — HasOwnProperty | 1.1 μs | 112 B |
+| Marshal — Dump nested object | 24 μs | 4.8 KB |
+| Marshal — HostToHandle Dictionary | 18 μs | 3.6 KB |
+| Snapshot — capture | 87 μs | 512 KB |
+| Snapshot — serialize to bytes | 12 μs | 512 KB |
+| Snapshot — restore VM | 4.1 ms | 231 KB |
+| ExportHandle | 0.8 μs | 112 B |
+| ImportHandle | 1.9 μs | 216 B |
+| Promise — create Deferred | 3.2 μs | 528 B |
+| Promise — resolve + await | 31 μs | 2.4 KB |
+
+> **Note:** Cold-start cost is dominated by Wasmtime WASM module instantiation and is paid once per `QuickJs.CreateAsync()` call. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
+
+---
 
 # Credits
 
