@@ -719,7 +719,9 @@ catch (JSException ex) when (ex.Name == "InternalError")
 
 ### 13.2 Stack size
 
-Limit the call stack depth (useful in sandboxes):
+Limit the native call stack depth (useful in sandboxes). The shipped WASM binary has a
+1 MiB linker-defined stack; the maximum safe value is 512 KiB (`512 * 1024`), which
+leaves headroom for native frames and stack-overflow exception handling:
 
 ```csharp
 using var vm = await QuickJs.CreateAsync(new QuickJsOptions
@@ -727,6 +729,8 @@ using var vm = await QuickJs.CreateAsync(new QuickJsOptions
     MaxStackSize = 256 * 1024, // 256 KB
 });
 ```
+
+Set to `0` to disable the QuickJS stack guard entirely.
 
 ### 13.3 Garbage collection
 
@@ -898,6 +902,11 @@ The binary format is identical to the TypeScript `serializeSnapshot` / `deserial
 ### 16.3 Re-registering host callbacks
 
 Host functions (registered with `NewHostFunction`) are stored by name inside the snapshot, but the .NET delegates are **not**. After `RestoreAsync` you must re-bind the delegates using `RegisterHostCallback` — this does not create a new WASM function object:
+
+> **Important:** If you call a guest function whose host callback has not been re-registered
+> after restore (or was removed with `UnregisterHostCallback`, or was from an ephemeral
+> handle that was disposed), the call **throws a `JSException`** rather than silently
+> returning `undefined`. This ensures snapshot-restore bugs fail loudly.
 
 ```csharp
 // Before snapshot

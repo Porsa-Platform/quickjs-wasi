@@ -152,9 +152,8 @@ public sealed class HandleLifetimeTests : TestBase
         var fn = vm.NewEphemeralFunction((_, _) => vm.UndefinedValue);
         vm.Global.SetProp("eph", fn);
         fn.Dispose();
-        // The callback is unregistered; an unregistered host callback yields undefined
-        using var result = vm.Eval("eph()");
-        Assert.True(result.IsUndefined);
+        // Calling the now-orphaned function should throw (callback unregistered)
+        Assert.Throws<JSException>(() => vm.Eval("eph()"));
     }
 
     [Fact]
@@ -190,16 +189,15 @@ public sealed class HandleLifetimeTests : TestBase
     }
 
     [Fact]
-    public async Task UnregisterHostCallback_CallReturnsUndefinedAfterUnregister()
+    public async Task UnregisterHostCallback_CallThrowsAfterUnregister()
     {
         if (!HasWasm) return;
         using var vm = await CreateVmAsync();
         using var fn = vm.NewHostFunction("cb", (_, _) => vm.UndefinedValue);
         vm.Global.SetProp("cb", fn);
         vm.UnregisterHostCallback("cb");
-        // An unregistered host callback yields undefined rather than throwing
-        using var result = vm.Eval("cb()");
-        Assert.True(result.IsUndefined);
+        // Any QuickJS function still referencing the name will throw when called
+        Assert.Throws<JSException>(() => vm.Eval("cb()"));
     }
 
     // ====================================================================

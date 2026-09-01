@@ -17,7 +17,19 @@ internal sealed class HostCallDispatcher
         var name = WasmMemoryAccessor.ReadUtf8(memory, namePtr, nameLen);
         if (!_vm.TryGetHostCallback(name, out var callback))
         {
-            return _vm.Exports.DupValue(_vm.UndefinedValue.Ptr);
+            // Throw inside the guest, as the docs promise: NewEphemeralFunction says
+            // "calling it after the handle is disposed throws, because the callback
+            // is gone" and UnregisterHostCallback says "any QuickJS function still
+            // referencing the name will throw when called".
+            // Silently returning undefined masked real bugs — a snapshot-restored VM
+            // calling a host function never re-registered would return undefined
+            // instead of failing loud.
+            using var err = _vm.NewError(
+                $"Host callback \"{name}\" is not registered: it was unregistered, " +
+                "its ephemeral function handle was disposed, or it was never " +
+                "re-registered after a snapshot restore.");
+            _vm.Exports.Throw(err.Ptr);
+            return 0;
         }
 
         using var thisHandle = new JSValueHandle(_vm, thisPtr, ownsValue: false);
