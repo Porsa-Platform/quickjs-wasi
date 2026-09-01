@@ -8,20 +8,25 @@ public sealed class JSValueHandle : IDisposable
     private readonly bool _isSingleton;
     private bool _disposed;
 
+    /// <summary>Whether this handle wraps a value owned by the C trampoline (host-callback args).</summary>
+    internal bool _isBorrowed;
+
     /// <summary>
     /// Extra cleanup to run when this handle is disposed — used by
     /// <see cref="QuickJs.NewEphemeralFunction"/> to unregister its host callback.
     /// </summary>
     internal Action? _onDispose;
 
-    internal JSValueHandle(QuickJs vm, int ptr, bool ownsValue = true, bool isSingleton = false)
+    internal JSValueHandle(QuickJs vm, int ptr, bool ownsValue = true, bool isSingleton = false, bool isBorrowed = false)
     {
         Vm = vm;
         Ptr = ptr;
         _ownsValue = ownsValue;
         _isSingleton = isSingleton;
-        // Singletons are shared and outlive any scope.
-        if (!isSingleton) vm._activeScope?.Add(this);
+        _isBorrowed = isBorrowed;
+        // Singletons and borrowed handles are not scope-tracked:
+        // singletons outlive any scope, and borrowed handles are owned by the C caller.
+        if (!isSingleton && !isBorrowed) vm._activeScope?.Add(this);
     }
 
     public QuickJs Vm { get; }
@@ -65,8 +70,27 @@ public sealed class JSValueHandle : IDisposable
 
     public JSValueHandle Dup() => new(Vm, Vm.Exports.DupValue(Ptr));
 
+    /// <summary>
+    /// The <c>length</c> property of this value (number of elements for arrays,
+    /// number of UTF-16 code units for strings, etc.).
+    /// </summary>
+    public int Length
+    {
+        get
+        {
+            using var lenHandle = GetProp("length");
+            return (int)lenHandle.ToNumber();
+        }
+    }
+
     public JSValueHandle GetProp(string name)
     {
+        if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
+        {
+            using var keyHandle = Vm.NewString(name);
+            return new JSValueHandle(Vm, Vm.Exports.GetPropValue(Ptr, keyHandle.Ptr));
+        }
+
         var written = Vm.WriteString(name);
         try
         {
@@ -82,6 +106,13 @@ public sealed class JSValueHandle : IDisposable
 
     public void SetProp(string name, JSValueHandle value)
     {
+        if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
+        {
+            using var keyHandle = Vm.NewString(name);
+            Vm.ThrowOnNegative(Vm.Exports.SetPropValue(Ptr, keyHandle.Ptr, value.Ptr));
+            return;
+        }
+
         var written = Vm.WriteString(name);
         try
         {
@@ -99,6 +130,13 @@ public sealed class JSValueHandle : IDisposable
     public void DefineProp(string name, JSValueHandle value, bool configurable = false, bool writable = false, bool enumerable = false)
     {
         var flags = (configurable ? 1 : 0) | (writable ? 2 : 0) | (enumerable ? 4 : 0);
+        if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
+        {
+            using var keyHandle = Vm.NewString(name);
+            Vm.ThrowOnNegative(Vm.Exports.DefinePropValue(Ptr, keyHandle.Ptr, value.Ptr, flags));
+            return;
+        }
+
         var written = Vm.WriteString(name);
         try
         {
@@ -243,6 +281,12 @@ public sealed class JSValueHandle : IDisposable
 
     public bool HasOwnProperty(string name)
     {
+        if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
+        {
+            using var keyHandle = Vm.NewString(name);
+            return Vm.Exports.HasOwnPropertyValue(Ptr, keyHandle.Ptr) != 0;
+        }
+
         var written = Vm.WriteString(name);
         try
         {
@@ -256,6 +300,12 @@ public sealed class JSValueHandle : IDisposable
 
     public bool PropertyIsEnumerable(string name)
     {
+        if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
+        {
+            using var keyHandle = Vm.NewString(name);
+            return Vm.Exports.PropertyIsEnumerableValue(Ptr, keyHandle.Ptr) != 0;
+        }
+
         var written = Vm.WriteString(name);
         try
         {
@@ -372,19 +422,27 @@ public sealed class JSValueHandle : IDisposable
 
     public string ToManagedString()
     {
-        var ptr = Vm.Exports.GetString(Ptr);
-        if (ptr == 0)
-        {
-            return string.Empty;
-        }
-
+        // Use qjs_get_string_len to get WTF-8 bytes and length, preserving lone surrogates and NULs.
+        var lenPtr = Vm.Exports.WasmMalloc(4);
         try
         {
-            return Vm.ReadCString(ptr);
+            var strPtr = Vm.Exports.GetStringLen(Ptr, lenPtr);
+            if (strPtr == 0) return string.Empty;
+            try
+            {
+                var len = WasmMemoryAccessor.ReadInt32(Vm.Exports.Memory, lenPtr);
+                if (len <= 0) return string.Empty;
+                var bytes = WasmMemoryAccessor.ReadBytes(Vm.Exports.Memory, strPtr, len);
+                return WasmMemoryAccessor.DecodeWtf8(bytes);
+            }
+            finally
+            {
+                Vm.Exports.FreeCString(strPtr);
+            }
         }
         finally
         {
-            Vm.Exports.FreeCString(ptr);
+            Vm.Exports.WasmFree(lenPtr);
         }
     }
 

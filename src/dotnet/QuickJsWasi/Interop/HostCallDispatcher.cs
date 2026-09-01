@@ -32,14 +32,14 @@ internal sealed class HostCallDispatcher
             return 0;
         }
 
-        using var thisHandle = new JSValueHandle(_vm, thisPtr, ownsValue: false);
+        using var thisHandle = new JSValueHandle(_vm, thisPtr, ownsValue: false, isBorrowed: true);
         var args = new JSValueHandle[argc];
         try
         {
             for (var i = 0; i < argc; i++)
             {
                 var ptr = WasmMemoryAccessor.ReadInt32(memory, argvPtr + (i * 4));
-                args[i] = new JSValueHandle(_vm, ptr, ownsValue: false);
+                args[i] = new JSValueHandle(_vm, ptr, ownsValue: false, isBorrowed: true);
             }
 
             var result = callback(thisHandle, args);
