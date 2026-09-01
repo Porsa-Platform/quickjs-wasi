@@ -1498,16 +1498,11 @@ int qjs_has_own_property(JSValue *obj, const char *name) {
     int ret = JS_GetOwnProperty(ctx, &desc, *obj, atom);
     JS_FreeAtom(ctx, atom);
     if (ret > 0) {
-        /* Free only the fields that JS_GetOwnProperty actually populated.
-           For data properties JS_PROP_GETSET is clear and only desc.value is
-           valid; for accessor properties JS_PROP_GETSET is set and only
-           desc.getter/desc.setter are valid. Freeing the wrong field would
-           dereference an uninitialised pointer. */
+        /* Free the descriptor fields to avoid leaks */
+        JS_FreeValue(ctx, desc.value);
         if (desc.flags & JS_PROP_GETSET) {
             JS_FreeValue(ctx, desc.getter);
             JS_FreeValue(ctx, desc.setter);
-        } else {
-            JS_FreeValue(ctx, desc.value);
         }
         return 1;
     }
@@ -1528,11 +1523,10 @@ int qjs_has_own_property_value(JSValue *obj, JSValue *key) {
     int ret = JS_GetOwnProperty(ctx, &desc, *obj, atom);
     JS_FreeAtom(ctx, atom);
     if (ret > 0) {
+        JS_FreeValue(ctx, desc.value);
         if (desc.flags & JS_PROP_GETSET) {
             JS_FreeValue(ctx, desc.getter);
             JS_FreeValue(ctx, desc.setter);
-        } else {
-            JS_FreeValue(ctx, desc.value);
         }
         return 1;
     }
@@ -1552,11 +1546,10 @@ int qjs_property_is_enumerable(JSValue *obj, const char *name) {
     JS_FreeAtom(ctx, atom);
     if (ret > 0) {
         int enumerable = (desc.flags & JS_PROP_ENUMERABLE) ? 1 : 0;
+        JS_FreeValue(ctx, desc.value);
         if (desc.flags & JS_PROP_GETSET) {
             JS_FreeValue(ctx, desc.getter);
             JS_FreeValue(ctx, desc.setter);
-        } else {
-            JS_FreeValue(ctx, desc.value);
         }
         return enumerable;
     }
@@ -1574,11 +1567,10 @@ int qjs_property_is_enumerable_value(JSValue *obj, JSValue *key) {
     JS_FreeAtom(ctx, atom);
     if (ret > 0) {
         int enumerable = (desc.flags & JS_PROP_ENUMERABLE) ? 1 : 0;
+        JS_FreeValue(ctx, desc.value);
         if (desc.flags & JS_PROP_GETSET) {
             JS_FreeValue(ctx, desc.getter);
             JS_FreeValue(ctx, desc.setter);
-        } else {
-            JS_FreeValue(ctx, desc.value);
         }
         return enumerable;
     }
