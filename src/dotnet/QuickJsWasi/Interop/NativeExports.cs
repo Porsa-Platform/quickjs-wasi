@@ -96,11 +96,15 @@ internal sealed class NativeExports
     public int IsWeakSet(int valuePtr) => Convert.ToInt32(Call("qjs_is_weak_set", valuePtr)!);
     public int IsDataView(int valuePtr) => Convert.ToInt32(Call("qjs_is_data_view", valuePtr)!);
     public int GetClassId(int valuePtr) => Convert.ToInt32(Call("qjs_get_class_id", valuePtr)!);
+    public int GetClassName(int valuePtr) => Convert.ToInt32(Call("qjs_get_class_name", valuePtr)!);
     public int GetProxyTarget(int valuePtr) => Convert.ToInt32(Call("qjs_get_proxy_target", valuePtr)!);
     public int GetProxyHandler(int valuePtr) => Convert.ToInt32(Call("qjs_get_proxy_handler", valuePtr)!);
     public int GetBool(int valuePtr) => Convert.ToInt32(Call("qjs_get_bool", valuePtr)!);
     public int DupValue(int valuePtr) => Convert.ToInt32(Call("qjs_dup_value", valuePtr)!);
     public void FreeValue(int valuePtr) => Call("qjs_free_value", valuePtr);
+    public int GetStringLen(int valuePtr, int plenPtr) => Convert.ToInt32(Call("qjs_get_string_len", valuePtr, plenPtr)!);
+    public int HasOwnPropertyValue(int objPtr, int keyPtr) => Convert.ToInt32(Call("qjs_has_own_property_value", objPtr, keyPtr)!);
+    public int PropertyIsEnumerableValue(int objPtr, int keyPtr) => Convert.ToInt32(Call("qjs_property_is_enumerable_value", objPtr, keyPtr)!);
     public int GetGlobal() => Convert.ToInt32(Call("qjs_get_global")!);
     public int GetPropString(int objPtr, int namePtr) => Convert.ToInt32(Call("qjs_get_prop_string", objPtr, namePtr)!);
     public int SetPropString(int objPtr, int namePtr, int valPtr) => Convert.ToInt32(Call("qjs_set_prop_string", objPtr, namePtr, valPtr)!);
@@ -124,6 +128,8 @@ internal sealed class NativeExports
     public int NewPromise(int resolveOutPtr, int rejectOutPtr) => Convert.ToInt32(Call("qjs_new_promise", resolveOutPtr, rejectOutPtr)!);
     public int PromiseState(int promisePtr) => Convert.ToInt32(Call("qjs_promise_state", promisePtr)!);
     public int PromiseResult(int promisePtr) => Convert.ToInt32(Call("qjs_promise_result", promisePtr)!);
+    public int PromiseThen(int promisePtr, int onFulfilledPtr, int onRejectedPtr) => Convert.ToInt32(Call("qjs_promise_then", promisePtr, onFulfilledPtr, onRejectedPtr)!);
+    public void PromiseMarkAsHandled(int promisePtr) => Call("qjs_promise_mark_as_handled", promisePtr);
     public int IsJobPending() => Convert.ToInt32(Call("qjs_is_job_pending")!);
     public int ExecutePendingJob() => Convert.ToInt32(Call("qjs_execute_pending_job")!);
     public int GetException() => Convert.ToInt32(Call("qjs_get_exception")!);

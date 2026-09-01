@@ -296,9 +296,43 @@ public sealed class QuickJs : IDisposable
         _hostCallbacks[name] = callback;
     }
 
+    /// <summary>
+    /// Export a handle as an opaque integer token (the raw WASM pointer of its <c>JSValue</c> box).
+    /// The token stays valid across VM snapshots and restores as long as the handle itself is alive.
+    /// Borrowed handles (host-callback arguments) cannot be exported; call <see cref="JSValueHandle.Dup"/>
+    /// on them first to obtain an owned copy.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Thrown when the handle is borrowed or disposed.</exception>
+    public int ExportHandle(JSValueHandle handle)
+    {
+        ArgumentNullException.ThrowIfNull(handle);
+        if (handle.Vm != this)
+            throw new InvalidOperationException("Cannot export a handle that belongs to a different VM.");
+        if (handle._isBorrowed)
+            throw new InvalidOperationException("Borrowed handles cannot be exported. Call Dup() first to obtain an owned copy.");
+        if (handle.Disposed)
+            throw new InvalidOperationException("Cannot export a disposed handle.");
+        return handle.Ptr;
+    }
+
+    /// <summary>
+    /// Import a handle from an opaque integer token previously produced by <see cref="ExportHandle"/>.
+    /// Returns a new independently-owned handle that duplicates the guest value. The caller is
+    /// responsible for disposing the returned handle.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">Thrown when the token is out of valid range.</exception>
+    public JSValueHandle ImportHandle(int token)
+    {
+        var memSize = Exports.Memory.GetSpan<byte>(0).Length;
+        if (token <= 0 || token >= memSize)
+            throw new ArgumentOutOfRangeException(nameof(token), "Token is not a valid handle pointer.");
+        var ptr = Exports.DupValue(token);
+        return new JSValueHandle(this, ptr);
+    }
+
     internal (int Ptr, int Length) WriteString(string value)
     {
-        var bytes = Encoding.UTF8.GetBytes(value);
+        var bytes = WasmMemoryAccessor.EncodeWtf8(value);
         var ptr = Exports.WasmMalloc(bytes.Length + 1);
         WasmMemoryAccessor.WriteBytes(Exports.Memory, ptr, bytes);
         WasmMemoryAccessor.WriteBytes(Exports.Memory, ptr + bytes.Length, new byte[] { 0 });
