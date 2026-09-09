@@ -365,6 +365,65 @@ public sealed class EvalTests : TestBase
         Assert.Contains("must be positive", ex.Message);
     }
 
+    [Fact]
+    public async Task HostFunction_AsyncDelegate_ResolvesAwaitedValue()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        var tcs = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var fn = vm.NewHostFunction("loadValue", async (_, _) => await tcs.Task, argCount: 0);
+        vm.Global.SetProp("loadValue", fn);
+
+        using var promise = vm.Eval("""
+            (async function () {
+                const result = await loadValue();
+                globalThis.asyncHostResult = result;
+                return result;
+            })()
+        """);
+        var task = vm.ResolvePromise(promise);
+
+        Assert.False(task.IsCompleted);
+        tcs.SetResult("done");
+        vm.ExecutePendingJobs();
+
+        var settled = await task;
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
+        Assert.Equal("done", fulfilled.Value.ToManagedString());
+        fulfilled.Value.Dispose();
+
+        using var check = vm.Eval("globalThis.asyncHostResult");
+        Assert.Equal("done", check.ToManagedString());
+    }
+
+    [Fact]
+    public async Task HostFunction_AsyncDelegate_RejectsAwaitedValue()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        using var fn = vm.NewHostFunction("failValue", (_, _) =>
+            Task.FromException<object?>(new InvalidOperationException("boom")));
+        vm.Global.SetProp("failValue", fn);
+
+        using var promise = vm.Eval("""
+            (async function () {
+                try {
+                    await failValue();
+                    return "unexpected";
+                } catch (error) {
+                    return error.message;
+                }
+            })()
+        """);
+        var task = vm.ResolvePromise(promise);
+        vm.ExecutePendingJobs();
+
+        var settled = await task;
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
+        Assert.Equal("boom", fulfilled.Value.ToManagedString());
+        fulfilled.Value.Dispose();
+    }
+
     // ====================================================================
     // 9 — Calling JS functions from .NET
     // ====================================================================
@@ -459,6 +518,42 @@ public sealed class EvalTests : TestBase
         var f = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
         Assert.Equal(42d, f.Value.ToNumber());
         f.Value.Dispose();
+    }
+
+    [Fact]
+    public async Task HostToHandle_TaskOfObject_BridgesToPromise()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        var tcs = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var promise = vm.HostToHandle(tcs.Task);
+
+        Assert.True(promise.IsPromise);
+        var task = vm.ResolvePromise(promise);
+
+        tcs.SetResult(new { fileRef = "ok", sizeBytes = 42d });
+        vm.ExecutePendingJobs();
+
+        var settled = await task;
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
+        using var fileRef = fulfilled.Value.GetProp("fileRef");
+        using var sizeBytes = fulfilled.Value.GetProp("sizeBytes");
+        Assert.Equal("ok", fileRef.ToManagedString());
+        Assert.Equal(42d, sizeBytes.ToNumber());
+        fulfilled.Value.Dispose();
+    }
+
+    [Fact]
+    public async Task HostToHandle_TaskWithoutResult_ResolvesUndefined()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        using var promise = vm.HostToHandle(Task.CompletedTask);
+
+        var settled = await vm.ResolvePromise(promise);
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
+        Assert.True(fulfilled.Value.IsUndefined);
+        fulfilled.Value.Dispose();
     }
 
     // ====================================================================
@@ -559,7 +654,7 @@ public sealed class EvalTests : TestBase
         if (!HasWasm) return;
         using var vm = await CreateVmAsync();
 
-        using var h1 = vm.HostToHandle(null);
+        using var h1 = vm.HostToHandle((object?)null);
         Assert.True(h1.IsNull);
 
         using var h2 = vm.HostToHandle(QuickJs.Undefined);

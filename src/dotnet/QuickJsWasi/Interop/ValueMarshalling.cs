@@ -173,6 +173,22 @@ internal static class ValueMarshalling
     {
         if (ReferenceEquals(value, QuickJs.Undefined)) return vm.UndefinedValue;
         if (value is null) return vm.NullValue;
+        if (value is JSValueHandle handle)
+        {
+            if (handle.Vm != vm)
+            {
+                throw new InvalidOperationException("Cannot marshal a handle that belongs to a different VM.");
+            }
+
+            if (handle.Disposed)
+            {
+                throw new InvalidOperationException("Cannot marshal a disposed handle.");
+            }
+
+            return handle.Dup();
+        }
+
+        if (value is Task task) return vm.HostToHandle(task);
         if (value is bool b) return b ? vm.TrueValue : vm.FalseValue;
         if (value is string s) return vm.NewString(s);
         if (value is byte[] bytes) return vm.NewArrayBuffer(bytes);
