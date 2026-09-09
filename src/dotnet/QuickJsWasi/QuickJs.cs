@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using QuickJsWasi.Interop;
 using Wasmtime;
@@ -5,6 +6,8 @@ using Wasmtime;
 namespace QuickJsWasi;
 
 public delegate JSValueHandle HostFunction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
+public delegate Task AsyncHostAction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
+public delegate Task<object?> AsyncHostFunction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
 
 public sealed class QuickJs : IDisposable
 {
@@ -18,6 +21,7 @@ public sealed class QuickJs : IDisposable
     private readonly Linker _linker;
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
+    private readonly ConcurrentQueue<Action> _pendingHostActions = new();
     private readonly WasiShim _wasi;
     private bool _disposed;
     private int _nextInternalId;
@@ -297,6 +301,22 @@ public sealed class QuickJs : IDisposable
     }
 
     /// <summary>
+    /// Re-register an async host callback after restoring from a snapshot.
+    /// The callback is invoked synchronously by QuickJS but its returned <see cref="Task"/>
+    /// or <see cref="Task{TResult}"/> is bridged to a QuickJS promise.
+    /// </summary>
+    public void RegisterHostCallback(string name, AsyncHostAction callback)
+        => RegisterHostCallback(name, WrapAsyncHostAction(callback));
+
+    /// <summary>
+    /// Re-register an async host callback after restoring from a snapshot.
+    /// The callback is invoked synchronously by QuickJS but its returned <see cref="Task"/>
+    /// is bridged to a QuickJS promise.
+    /// </summary>
+    public void RegisterHostCallback(string name, AsyncHostFunction callback)
+        => RegisterHostCallback(name, WrapAsyncHostFunction(callback));
+
+    /// <summary>
     /// Export a handle as an opaque integer token (the raw WASM pointer of its <c>JSValue</c> box).
     /// The token stays valid across VM snapshots and restores as long as the handle itself is alive.
     /// Borrowed handles (host-callback arguments) cannot be exported; call <see cref="JSValueHandle.Dup"/>
@@ -441,8 +461,19 @@ public sealed class QuickJs : IDisposable
     public int ExecutePendingJobs()
     {
         var count = 0;
-        while (Exports.IsJobPending() != 0)
+        while (true)
         {
+            count += DrainPendingHostActions();
+            if (Exports.IsJobPending() == 0)
+            {
+                if (_pendingHostActions.IsEmpty)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
             var result = Exports.ExecutePendingJob();
             if (result < 0)
             {
@@ -646,6 +677,22 @@ public sealed class QuickJs : IDisposable
         }
     }
 
+    /// <summary>
+    /// Create a new QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewHostFunction(string name, AsyncHostAction callback, int argCount = 0)
+        => NewHostFunction(name, WrapAsyncHostAction(callback), argCount);
+
+    /// <summary>
+    /// Create a new QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewHostFunction(string name, AsyncHostFunction callback, int argCount = 0)
+        => NewHostFunction(name, WrapAsyncHostFunction(callback), argCount);
+
     public Deferred NewPromise()
     {
         var resolveOutPtr = Exports.WasmMalloc(4);
@@ -813,6 +860,22 @@ public sealed class QuickJs : IDisposable
     }
 
     /// <summary>
+    /// Create a short-lived QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewEphemeralFunction(AsyncHostAction fn)
+        => NewEphemeralFunction(WrapAsyncHostAction(fn));
+
+    /// <summary>
+    /// Create a short-lived QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewEphemeralFunction(AsyncHostFunction fn)
+        => NewEphemeralFunction(WrapAsyncHostFunction(fn));
+
+    /// <summary>
     /// Remove a host callback registered with <see cref="NewHostFunction"/> or
     /// <see cref="RegisterHostCallback"/>. Returns <c>true</c> if a callback was
     /// removed.
@@ -827,6 +890,18 @@ public sealed class QuickJs : IDisposable
     }
 
     public object? Dump(JSValueHandle handle) => ValueMarshalling.Dump(this, handle);
+
+    public JSValueHandle HostToHandle(Task task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return HostTaskToHandle(task);
+    }
+
+    public JSValueHandle HostToHandle<T>(Task<T> task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return HostTaskToHandle(task);
+    }
 
     public JSValueHandle HostToHandle(object? value) => ValueMarshalling.HostToHandle(this, value);
 
@@ -934,6 +1009,127 @@ public sealed class QuickJs : IDisposable
         _linker.Dispose();
         _module.Dispose();
         _engine.Dispose();
+    }
+
+    private int DrainPendingHostActions()
+    {
+        var count = 0;
+        while (_pendingHostActions.TryDequeue(out var action))
+        {
+            action();
+            count++;
+        }
+
+        return count;
+    }
+
+    private HostFunction WrapAsyncHostAction(AsyncHostAction callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        return (thisValue, arguments) =>
+        {
+            try
+            {
+                return HostTaskToHandle(callback(thisValue, arguments));
+            }
+            catch (Exception ex)
+            {
+                return HostTaskToHandle(Task.FromException(ex));
+            }
+        };
+    }
+
+    private HostFunction WrapAsyncHostFunction(AsyncHostFunction callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        return (thisValue, arguments) =>
+        {
+            try
+            {
+                return HostTaskToHandle(callback(thisValue, arguments));
+            }
+            catch (Exception ex)
+            {
+                return HostTaskToHandle(Task.FromException<object?>(ex));
+            }
+        };
+    }
+
+    private JSValueHandle HostTaskToHandle(Task task)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+
+        var deferred = NewPromise();
+        if (task.IsCompleted)
+        {
+            CompleteDeferredFromTask(task, deferred);
+            return deferred.Handle;
+        }
+
+        task.ContinueWith(
+            static (completedTask, state) =>
+            {
+                var (vm, pending) = ((QuickJs Vm, Deferred Deferred))state!;
+                vm._pendingHostActions.Enqueue(() => vm.CompleteDeferredFromTask(completedTask, pending));
+            },
+            (this, deferred),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        return deferred.Handle;
+    }
+
+    private void CompleteDeferredFromTask(Task task, Deferred deferred)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (task.IsCanceled)
+        {
+            using var canceled = NewError(new TaskCanceledException(task));
+            deferred.Reject(canceled);
+            return;
+        }
+
+        if (task.IsFaulted)
+        {
+            var exception = task.Exception?.InnerException ?? task.Exception!;
+            if (exception is JSException jsException)
+            {
+                using var rejected = jsException.Handle.Dup();
+                deferred.Reject(rejected);
+                return;
+            }
+
+            using var rejected = NewError(exception);
+            deferred.Reject(rejected);
+            return;
+        }
+
+        if (TryGetTaskResult(task, out var result))
+        {
+            using var resolved = HostToHandle(result);
+            deferred.Resolve(resolved);
+            return;
+        }
+
+        deferred.Resolve(UndefinedValue);
+    }
+
+    private static bool TryGetTaskResult(Task task, out object? result)
+    {
+        var property = task.GetType().GetProperty("Result");
+        if (property is null)
+        {
+            result = null;
+            return false;
+        }
+
+        result = property.GetValue(task);
+        return true;
     }
 
     private sealed class HandleScopeImpl : IHandleScope

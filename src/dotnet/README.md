@@ -511,6 +511,22 @@ catch (JSException ex)
 }
 ```
 
+Async host callbacks are also supported. They return a QuickJS `Promise`
+immediately and settle it when the returned `Task` completes:
+
+```csharp
+using var loadFn = vm.NewHostFunction("loadFile", async (_, args) =>
+{
+    byte[] bytes = await File.ReadAllBytesAsync(args[0].ToManagedString());
+    return new { size = bytes.Length };
+});
+vm.Global.SetProp("loadFile", loadFn);
+```
+
+> **Important:** QuickJS's microtask queue still does not run automatically.
+> After an async host callback's task completes, call `ExecutePendingJobs()` to
+> continue any guest-side `await` / `.then()` chains that depend on it.
+
 ### 8.1 Ephemeral functions
 
 Use `NewEphemeralFunction` when you need an anonymous, one-shot host callback whose lifetime is tied to a C# scope rather than a persistent name. Disposing the returned handle automatically unregisters the callback — any subsequent JS call to that function throws `JSException`.
@@ -623,6 +639,20 @@ switch (settled)
 }
 ```
 
+`HostToHandle` also accepts `Task` / `Task<T>` and bridges them to QuickJS
+promises using the same mechanism:
+
+```csharp
+var tcs = new TaskCompletionSource<string>();
+using var promise = vm.HostToHandle(tcs.Task);
+
+var task = vm.ResolvePromise(promise);
+tcs.SetResult("done");
+vm.ExecutePendingJobs();
+
+var settled = await task;
+```
+
 If the handle passed to `ResolvePromise` is not a promise, it is treated as an immediately fulfilled value.
 
 ### 10.3 Executing the microtask queue
@@ -725,6 +755,9 @@ using var h9  = vm.HostToHandle(new Dictionary<string, object?> { ["x"] = 1 });
 
 // POCOs become plain JS objects (public readable properties)
 using var h10 = vm.HostToHandle(new { Name = "Bob", Age = 30 });
+
+// Tasks become JS promises
+using var h11 = vm.HostToHandle(Task.FromResult<object?>(new { ok = true }));
 ```
 
 ---
@@ -1042,7 +1075,7 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `NewUInt8Array(data)`                                 | Create a JS `Uint8Array` (copies bytes)                    |
 | `NewError(message)`                                   | Create a JS `Error` from a string                          |
 | `NewError(exception)`                                 | Create a JS `Error` from a .NET exception                  |
-| `NewHostFunction(name, callback, argCount?)`          | Register a host function callable from JS                  |
+| `NewHostFunction(name, callback, argCount?)`          | Register a sync or async host function callable from JS    |
 | `NewEphemeralFunction(callback)`                      | Anonymous host function — unregistered when handle disposed |
 | `RegisterHostCallback(name, callback)`                | Re-bind a host callback after restore (no duplicate check) |
 | `UnregisterHostCallback(name)`                        | Remove a named host callback (subsequent calls throw)      |
@@ -1052,7 +1085,7 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `GetException()`                                      | Retrieve the pending JS exception                          |
 | `GetPromiseResult(promise)`                           | Get the settled value of a promise                         |
 | `Dump(handle)`                                        | Convert JS value → .NET object                             |
-| `HostToHandle(value)`                                 | Convert .NET object → `JSValueHandle`                      |
+| `HostToHandle(value)`                                 | Convert .NET object / `Task` → `JSValueHandle`             |
 | `Snapshot()`                                          | Capture VM state as `Snapshot`                             |
 | `RunGc()`                                             | Trigger GC now                                             |
 | `GetMemoryUsage()`                                    | Detailed memory statistics (`MemoryUsage`)                 |
@@ -1186,7 +1219,7 @@ Tests skip gracefully when `quickjs.wasm` is absent (the binary is git-ignored),
 | `async create()`                                 | `Task<QuickJs> CreateAsync()`                | Returns a completed task; async signature kept for compatibility.                                                     |
 | `resolvePromise()` → `Promise<{value}\|{error}>` | `ResolvePromise()` → `Task<JSPromiseResult>` | `JSPromiseResult` is a discriminated union.                                                                           |
 | `versions` includes npm package version          | `Versions` includes engine version only      | No equivalent of the npm package version in .NET.                                                                     |
-| `hostToHandle(Promise)` wraps host promises      | Not supported                                | .NET `Task` cannot be synchronously awaited inside the WASM call stack; use `NewPromise()` + `Deferred`.              |
+| `hostToHandle(Promise)` wraps host promises      | `HostToHandle(Task/Task<T>)` wraps host tasks | Both sides bridge host async work by returning a QuickJS promise immediately and settling it later.                   |
 | Extensions                                       | Not supported                                | Dynamic WASM module composition via Wasmtime .NET SDK is not available. Snapshots with extensions cannot be restored. |
 
 ## Packages used
