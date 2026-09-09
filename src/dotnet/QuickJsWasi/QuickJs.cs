@@ -1099,13 +1099,13 @@ public sealed class QuickJs : IDisposable
             var exception = task.Exception?.InnerException ?? task.Exception!;
             if (exception is JSException jsException)
             {
-                using var rejected = jsException.Handle.Dup();
-                deferred.Reject(rejected);
+                using var guestError = jsException.Handle.Dup();
+                deferred.Reject(guestError);
                 return;
             }
 
-            using var rejected = NewError(exception);
-            deferred.Reject(rejected);
+            using var hostError = NewError(exception);
+            deferred.Reject(hostError);
             return;
         }
 

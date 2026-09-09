@@ -654,7 +654,7 @@ public sealed class EvalTests : TestBase
         if (!HasWasm) return;
         using var vm = await CreateVmAsync();
 
-        using var h1 = vm.HostToHandle(null);
+        using var h1 = vm.HostToHandle((object?)null);
         Assert.True(h1.IsNull);
 
         using var h2 = vm.HostToHandle(QuickJs.Undefined);
