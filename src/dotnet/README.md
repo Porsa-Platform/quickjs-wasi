@@ -833,7 +833,9 @@ catch (JSException ex) when (ex.Name == "InternalError")
 By default all built-in JavaScript features are available. Pass a bitmask to `Intrinsics` to create a minimal, hardened sandbox:
 
 ```csharp
-// // Disable eval() and Function(). Note: in this build, Intrinsics.EVAL also // controls the VM's source evaluation/compile path, so host-side vm.Eval(...) // and vm.Compile(...) will not work when this intrinsic is removed.
+// Disable eval() and Function(). Note: in this build, Intrinsics.EVAL also
+// controls the VM's source evaluation/compile path, so host-side vm.Eval(...)
+// and vm.Compile(...) will not work when this intrinsic is removed.
 int intrinsics = Intrinsics.ALL & ~Intrinsics.EVAL;
 
 using var vm = await QuickJs.CreateAsync(new QuickJsOptions
