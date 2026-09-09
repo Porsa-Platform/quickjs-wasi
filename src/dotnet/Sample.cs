@@ -365,7 +365,46 @@ Console.WriteLine($"QuickJS version: {vm.Versions["quickjs"]}");
 }
 
 // ====================================================================
-// 10.2 — ResolvePromise (await promise settlement)
+// 10.2 — Async host callback (Task<T> → Promise bridge)
+// ====================================================================
+
+{
+    TaskCompletionSource<string>? pendingText = null;
+
+    using var loadAsync = vm.NewHostFunction("loadAsync", async (_, _) =>
+    {
+        pendingText = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        return (object?)await pendingText.Task;
+    });
+    vm.Global.SetProp("loadAsync", loadAsync);
+
+    using var promise = vm.Eval("""
+        (async function () {
+            const value = await loadAsync();
+            globalThis.asyncHostValue = value;
+            return value;
+        })()
+    """);
+
+    var pending = vm.ResolvePromise(promise);
+    pendingText!.SetResult("done from async host");
+    vm.ExecutePendingJobs();
+
+    var settled = await pending;
+    if (settled is JSPromiseResult.Fulfilled fulfilled)
+    {
+        using (fulfilled.Value)
+        {
+            Console.WriteLine($"10.2 Async host function: {fulfilled.Value.ToManagedString()}"); // done from async host
+        }
+    }
+
+    using var asyncHostValue = vm.Eval("globalThis.asyncHostValue");
+    Console.WriteLine($"   Guest observed: {asyncHostValue.ToManagedString()}"); // done from async host
+}
+
+// ====================================================================
+// 10.3 — ResolvePromise (await promise settlement)
 // ====================================================================
 
 {
@@ -375,25 +414,25 @@ Console.WriteLine($"QuickJS version: {vm.Versions["quickjs"]}");
     switch (settled2)
     {
         case JSPromiseResult.Fulfilled f:
-            Console.WriteLine($"10.2 ResolvePromise: {f.Value.ToNumber()}"); // 123
+            Console.WriteLine($"10.3 ResolvePromise: {f.Value.ToNumber()}"); // 123
             f.Value.Dispose();
             break;
         case JSPromiseResult.Rejected r:
-            Console.WriteLine($"10.2 Rejected: {r.Error.ToManagedString()}");
+            Console.WriteLine($"10.3 Rejected: {r.Error.ToManagedString()}");
             r.Error.Dispose();
             break;
     }
 }
 
 // ====================================================================
-// 10.3 — ExecutePendingJobs
+// 10.4 — ExecutePendingJobs
 // ====================================================================
 
 {
     vm.Eval("Promise.resolve(42).then(v => globalThis.promiseVal = v)");
     int jobsRun = vm.ExecutePendingJobs();
     using var pv = vm.Eval("globalThis.promiseVal");
-    Console.WriteLine($"10.3 ExecutePendingJobs: {jobsRun} job(s), value={pv.ToNumber()}"); // 1, 42
+    Console.WriteLine($"10.4 ExecutePendingJobs: {jobsRun} job(s), value={pv.ToNumber()}"); // 1, 42
 }
 
 // ====================================================================
