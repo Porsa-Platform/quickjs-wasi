@@ -16,15 +16,22 @@ public sealed class QuickJs : IDisposable
         public override string ToString() => "undefined";
     }
 
+    private sealed class PendingTaskBridge(Task task, Deferred deferred)
+    {
+        public Task Task { get; } = task;
+        public Deferred Deferred { get; } = deferred;
+    }
+
     private readonly Engine _engine;
     private readonly Wasmtime.Module _module;
     private readonly Linker _linker;
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
-    private readonly ConcurrentQueue<Action> _pendingHostActions = new();
+    private readonly ConcurrentDictionary<int, PendingTaskBridge> _pendingTaskBridges = new();
     private readonly WasiShim _wasi;
     private bool _disposed;
     private int _nextInternalId;
+    private int _nextPendingTaskBridgeId;
 
     /// <summary>
     /// The innermost active <see cref="WithScope{T}"/> batch, if any.
@@ -463,10 +470,12 @@ public sealed class QuickJs : IDisposable
         var count = 0;
         while (true)
         {
-            count += DrainPendingHostActions();
+            count += DrainCompletedTaskBridges();
             if (Exports.IsJobPending() == 0)
             {
-                if (_pendingHostActions.IsEmpty)
+                var moreCompleted = DrainCompletedTaskBridges();
+                count += moreCompleted;
+                if (moreCompleted == 0)
                 {
                     break;
                 }
@@ -1011,13 +1020,21 @@ public sealed class QuickJs : IDisposable
         _engine.Dispose();
     }
 
-    private int DrainPendingHostActions()
+    private int DrainCompletedTaskBridges()
     {
         var count = 0;
-        while (_pendingHostActions.TryDequeue(out var action))
+        foreach (var entry in _pendingTaskBridges)
         {
-            action();
-            count++;
+            if (!entry.Value.Task.IsCompleted)
+            {
+                continue;
+            }
+
+            if (_pendingTaskBridges.TryRemove(entry.Key, out var pending))
+            {
+                CompleteDeferredFromTask(pending.Task, pending.Deferred);
+                count++;
+            }
         }
 
         return count;
@@ -1066,16 +1083,8 @@ public sealed class QuickJs : IDisposable
             return deferred.Handle;
         }
 
-        task.ContinueWith(
-            static (completedTask, state) =>
-            {
-                var (vm, pending) = ((QuickJs Vm, Deferred Deferred))state!;
-                vm._pendingHostActions.Enqueue(() => vm.CompleteDeferredFromTask(completedTask, pending));
-            },
-            (this, deferred),
-            CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously,
-            TaskScheduler.Default);
+        var bridgeId = Interlocked.Increment(ref _nextPendingTaskBridgeId);
+        _pendingTaskBridges[bridgeId] = new PendingTaskBridge(task, deferred);
 
         return deferred.Handle;
     }
@@ -1122,7 +1131,7 @@ public sealed class QuickJs : IDisposable
     private static bool TryGetTaskResult(Task task, out object? result)
     {
         var property = task.GetType().GetProperty("Result");
-        if (property is null)
+        if (property is null || property.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult")
         {
             result = null;
             return false;
