@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using QuickJsWasi.Interop;
 using Wasmtime;
@@ -5,6 +6,8 @@ using Wasmtime;
 namespace QuickJsWasi;
 
 public delegate JSValueHandle HostFunction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
+public delegate Task AsyncHostAction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
+public delegate Task<object?> AsyncHostFunction(JSValueHandle thisValue, IReadOnlyList<JSValueHandle> arguments);
 
 public sealed class QuickJs : IDisposable
 {
@@ -13,14 +16,22 @@ public sealed class QuickJs : IDisposable
         public override string ToString() => "undefined";
     }
 
+    private sealed class PendingTaskBridge(Task task, Deferred deferred)
+    {
+        public Task Task { get; } = task;
+        public Deferred Deferred { get; } = deferred;
+    }
+
     private readonly Engine _engine;
     private readonly Wasmtime.Module _module;
     private readonly Linker _linker;
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<int, PendingTaskBridge> _pendingTaskBridges = new();
     private readonly WasiShim _wasi;
     private bool _disposed;
     private int _nextInternalId;
+    private int _nextPendingTaskBridgeId;
 
     /// <summary>
     /// The innermost active <see cref="WithScope{T}"/> batch, if any.
@@ -297,6 +308,22 @@ public sealed class QuickJs : IDisposable
     }
 
     /// <summary>
+    /// Re-register an async host callback after restoring from a snapshot.
+    /// The callback is invoked synchronously by QuickJS but its returned <see cref="Task"/>
+    /// or <see cref="Task{TResult}"/> is bridged to a QuickJS promise.
+    /// </summary>
+    public void RegisterHostCallback(string name, AsyncHostAction callback)
+        => RegisterHostCallback(name, WrapAsyncHostAction(callback));
+
+    /// <summary>
+    /// Re-register an async host callback after restoring from a snapshot.
+    /// The callback is invoked synchronously by QuickJS but its returned <see cref="Task"/>
+    /// is bridged to a QuickJS promise.
+    /// </summary>
+    public void RegisterHostCallback(string name, AsyncHostFunction callback)
+        => RegisterHostCallback(name, WrapAsyncHostFunction(callback));
+
+    /// <summary>
     /// Export a handle as an opaque integer token (the raw WASM pointer of its <c>JSValue</c> box).
     /// The token stays valid across VM snapshots and restores as long as the handle itself is alive.
     /// Borrowed handles (host-callback arguments) cannot be exported; call <see cref="JSValueHandle.Dup"/>
@@ -441,8 +468,21 @@ public sealed class QuickJs : IDisposable
     public int ExecutePendingJobs()
     {
         var count = 0;
-        while (Exports.IsJobPending() != 0)
+        while (true)
         {
+            count += DrainCompletedTaskBridges();
+            if (Exports.IsJobPending() == 0)
+            {
+                var moreCompleted = DrainCompletedTaskBridges();
+                count += moreCompleted;
+                if (moreCompleted == 0)
+                {
+                    break;
+                }
+
+                continue;
+            }
+
             var result = Exports.ExecutePendingJob();
             if (result < 0)
             {
@@ -646,6 +686,22 @@ public sealed class QuickJs : IDisposable
         }
     }
 
+    /// <summary>
+    /// Create a new QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewHostFunction(string name, AsyncHostAction callback, int argCount = 0)
+        => NewHostFunction(name, WrapAsyncHostAction(callback), argCount);
+
+    /// <summary>
+    /// Create a new QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewHostFunction(string name, AsyncHostFunction callback, int argCount = 0)
+        => NewHostFunction(name, WrapAsyncHostFunction(callback), argCount);
+
     public Deferred NewPromise()
     {
         var resolveOutPtr = Exports.WasmMalloc(4);
@@ -813,6 +869,22 @@ public sealed class QuickJs : IDisposable
     }
 
     /// <summary>
+    /// Create a short-lived QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewEphemeralFunction(AsyncHostAction fn)
+        => NewEphemeralFunction(WrapAsyncHostAction(fn));
+
+    /// <summary>
+    /// Create a short-lived QuickJS function backed by an async host callback.
+    /// The callback returns immediately with a QuickJS promise, which settles when
+    /// the returned task completes.
+    /// </summary>
+    public JSValueHandle NewEphemeralFunction(AsyncHostFunction fn)
+        => NewEphemeralFunction(WrapAsyncHostFunction(fn));
+
+    /// <summary>
     /// Remove a host callback registered with <see cref="NewHostFunction"/> or
     /// <see cref="RegisterHostCallback"/>. Returns <c>true</c> if a callback was
     /// removed.
@@ -827,6 +899,18 @@ public sealed class QuickJs : IDisposable
     }
 
     public object? Dump(JSValueHandle handle) => ValueMarshalling.Dump(this, handle);
+
+    public JSValueHandle HostToHandle(Task task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return HostTaskToHandle(task);
+    }
+
+    public JSValueHandle HostToHandle<T>(Task<T> task)
+    {
+        ArgumentNullException.ThrowIfNull(task);
+        return HostTaskToHandle(task);
+    }
 
     public JSValueHandle HostToHandle(object? value) => ValueMarshalling.HostToHandle(this, value);
 
@@ -934,6 +1018,127 @@ public sealed class QuickJs : IDisposable
         _linker.Dispose();
         _module.Dispose();
         _engine.Dispose();
+    }
+
+    private int DrainCompletedTaskBridges()
+    {
+        var count = 0;
+        foreach (var entry in _pendingTaskBridges)
+        {
+            if (!entry.Value.Task.IsCompleted)
+            {
+                continue;
+            }
+
+            if (_pendingTaskBridges.TryRemove(entry.Key, out var pending))
+            {
+                CompleteDeferredFromTask(pending.Task, pending.Deferred);
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private HostFunction WrapAsyncHostAction(AsyncHostAction callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        return (thisValue, arguments) =>
+        {
+            try
+            {
+                return HostTaskToHandle(callback(thisValue, arguments));
+            }
+            catch (Exception ex)
+            {
+                return HostTaskToHandle(Task.FromException(ex));
+            }
+        };
+    }
+
+    private HostFunction WrapAsyncHostFunction(AsyncHostFunction callback)
+    {
+        ArgumentNullException.ThrowIfNull(callback);
+        return (thisValue, arguments) =>
+        {
+            try
+            {
+                return HostTaskToHandle(callback(thisValue, arguments));
+            }
+            catch (Exception ex)
+            {
+                return HostTaskToHandle(Task.FromException<object?>(ex));
+            }
+        };
+    }
+
+    private JSValueHandle HostTaskToHandle(Task task)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+
+        var deferred = NewPromise();
+        if (task.IsCompleted)
+        {
+            CompleteDeferredFromTask(task, deferred);
+            return deferred.Handle;
+        }
+
+        var bridgeId = Interlocked.Increment(ref _nextPendingTaskBridgeId);
+        _pendingTaskBridges[bridgeId] = new PendingTaskBridge(task, deferred);
+
+        return deferred.Handle;
+    }
+
+    private void CompleteDeferredFromTask(Task task, Deferred deferred)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (task.IsCanceled)
+        {
+            using var canceled = NewError(new TaskCanceledException(task));
+            deferred.Reject(canceled);
+            return;
+        }
+
+        if (task.IsFaulted)
+        {
+            var exception = task.Exception?.InnerException ?? task.Exception!;
+            if (exception is JSException jsException)
+            {
+                using var guestError = jsException.Handle.Dup();
+                deferred.Reject(guestError);
+                return;
+            }
+
+            using var hostError = NewError(exception);
+            deferred.Reject(hostError);
+            return;
+        }
+
+        if (TryGetTaskResult(task, out var result))
+        {
+            using var resolved = HostToHandle(result);
+            deferred.Resolve(resolved);
+            return;
+        }
+
+        deferred.Resolve(UndefinedValue);
+    }
+
+    private static bool TryGetTaskResult(Task task, out object? result)
+    {
+        var property = task.GetType().GetProperty("Result");
+        if (property is null || property.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult")
+        {
+            result = null;
+            return false;
+        }
+
+        result = property.GetValue(task);
+        return true;
     }
 
     private sealed class HandleScopeImpl : IHandleScope
