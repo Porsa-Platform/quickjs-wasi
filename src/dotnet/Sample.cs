@@ -388,7 +388,9 @@ Console.WriteLine($"QuickJS version: {vm.Versions["quickjs"]}");
 
     var pending = vm.ResolvePromise(promise);
     pendingText!.SetResult("done from async host");
-    vm.ExecutePendingJobs();
+    // Awaits the async lambda's task (which completes on a thread-pool continuation)
+    // and keeps pumping until the guest chain has finished.
+    await vm.ExecutePendingJobsAsync();
 
     var settled = await pending;
     if (settled is JSPromiseResult.Fulfilled fulfilled)

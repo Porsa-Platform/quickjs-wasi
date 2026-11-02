@@ -524,8 +524,18 @@ vm.Global.SetProp("loadFile", loadFn);
 ```
 
 > **Important:** QuickJS's microtask queue still does not run automatically.
-> After an async host callback's task completes, call `ExecutePendingJobs()` to
-> continue any guest-side `await` / `.then()` chains that depend on it.
+> Use `await vm.ExecutePendingJobsAsync()` to drive guest-side `await` / `.then()`
+> chains that depend on async host callbacks: it runs the queue, awaits any host
+> tasks still in flight, delivers their results, and repeats until nothing is left.
+> `ExecutePendingJobs()` only delivers tasks that have *already* completed when it
+> is called, so a task finishing a moment later (e.g. an `async` lambda whose
+> continuation is still queued on the thread pool) would be missed.
+
+```csharp
+using var promise = vm.Eval("loadFile('data.bin').then(r => r.size)");
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+await vm.ExecutePendingJobsAsync(cts.Token); // bound the wait in case a host task never completes
+```
 
 ### 8.1 Ephemeral functions
 
@@ -663,6 +673,10 @@ QuickJS's job queue does **not** run automatically. You must call `ExecutePendin
 vm.Eval("Promise.resolve(42).then(v => console.log(v))");
 int jobsRun = vm.ExecutePendingJobs(); // prints "42", returns 1
 ```
+
+When async host callbacks are involved, use `await vm.ExecutePendingJobsAsync(cancellationToken)`
+instead (see [section 8](#8-host-functions)): it also waits for in-flight host tasks and keeps
+pumping until both the queue and the host tasks are drained.
 
 ---
 
@@ -1063,6 +1077,7 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `Compile(code, filename?, evalFlags?, compileFlags?)` | Compile to `byte[]` bytecode                               |
 | `EvalBytecode(bytecode)`                              | Execute compiled bytecode                                  |
 | `ExecutePendingJobs()`                                | Run the microtask queue; returns job count                 |
+| `ExecutePendingJobsAsync(cancellationToken?)`         | Run jobs and await in-flight async host tasks until drained |
 | `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>`         |
 | `CallFunction(func, thisVal, args...)`                | Call a JS function; throws on exception                    |
 | `NewString(value)`                                    | Create a JS string                                         |

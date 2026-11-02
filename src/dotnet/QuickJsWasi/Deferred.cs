@@ -20,22 +20,37 @@ public sealed class Deferred
 
     public Task Settled => _tcs.Task;
 
-    public void Resolve(JSValueHandle value)
-    {
-        _vm.CallFunctionRaw(_resolve, _vm.UndefinedValue, value).Dispose();
-        Complete();
-    }
+    /// <summary>
+    /// Resolve the promise. Only the first <see cref="Resolve"/> or <see cref="Reject"/>
+    /// call settles it; later calls are no-ops.
+    /// </summary>
+    public void Resolve(JSValueHandle value) => Settle(_resolve, value);
 
-    public void Reject(JSValueHandle value)
-    {
-        _vm.CallFunctionRaw(_reject, _vm.UndefinedValue, value).Dispose();
-        Complete();
-    }
+    /// <summary>
+    /// Reject the promise. Only the first <see cref="Resolve"/> or <see cref="Reject"/>
+    /// call settles it; later calls are no-ops.
+    /// </summary>
+    public void Reject(JSValueHandle value) => Settle(_reject, value);
 
-    private void Complete()
+    private void Settle(JSValueHandle resolver, JSValueHandle value)
     {
-        if (Interlocked.Exchange(ref _completed, 1) == 0)
+        // Mark as settled before calling the resolver: resolving with an object
+        // synchronously reads its `then` property, which can re-enter host code
+        // that calls Resolve()/Reject() again. Those nested calls must be no-ops
+        // so they don't free the resolver that is still executing.
+        if (Interlocked.Exchange(ref _completed, 1) != 0)
         {
+            return;
+        }
+
+        try
+        {
+            _vm.CallFunctionRaw(resolver, _vm.UndefinedValue, value).Dispose();
+        }
+        finally
+        {
+            // Both functions retain the promise, including its eventual value,
+            // so release both once either has been called.
             _resolve.Dispose();
             _reject.Dispose();
             _tcs.TrySetResult();

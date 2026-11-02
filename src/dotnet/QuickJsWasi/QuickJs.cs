@@ -495,6 +495,43 @@ public sealed class QuickJs : IDisposable
         return count;
     }
 
+    /// <summary>
+    /// Run the microtask queue until it is empty <i>and</i> every task returned by an async
+    /// host callback (or passed to <see cref="HostToHandle(Task)"/>) has completed and been
+    /// delivered to the guest. Returns the total number of jobs run.
+    ///
+    /// <para>
+    /// <see cref="ExecutePendingJobs"/> only delivers host tasks that have already completed
+    /// when it is called. A task that completes a moment later — e.g. an <c>async</c> lambda
+    /// whose continuation is still queued on the thread pool — is missed, and nothing resumes
+    /// the guest. This method awaits those tasks instead, so guest <c>await</c> chains that
+    /// depend on host I/O run to completion.
+    /// </para>
+    ///
+    /// <para>
+    /// If a host task never completes, this never returns; pass a
+    /// <paramref name="cancellationToken"/> to bound the wait. The VM is not thread-safe:
+    /// do not use it from other threads while this call is awaiting.
+    /// </para>
+    /// </summary>
+    /// <exception cref="JSException">A job threw an uncaught guest exception.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<int> ExecutePendingJobsAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+
+        var count = ExecutePendingJobs();
+        while (!_pendingTaskBridges.IsEmpty)
+        {
+            var pending = _pendingTaskBridges.Values.Select(bridge => bridge.Task).ToArray();
+            await Task.WhenAny(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+            if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+            count += ExecutePendingJobs();
+        }
+
+        return count;
+    }
+
     public JSValueHandle GetException() => new(this, Exports.GetException());
 
     public JSValueHandle GetPromiseResult(JSValueHandle promise) => new(this, Exports.PromiseResult(promise.Ptr));
