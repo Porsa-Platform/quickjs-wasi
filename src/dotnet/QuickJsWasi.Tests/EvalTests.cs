@@ -868,14 +868,8 @@ public sealed class EvalTests : TestBase
         // DateTimeOffset.Offset.TotalMinutes is minutes EAST of UTC, so negate.
         var expected = -(int)TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.UnixEpoch).TotalMinutes;
 
-        // Some WASM builds may not include the --wrap=__secs_to_zone linker flag,
-        // in which case the C# callback is never called and the offset is 0.
-        if (actual == 0)
-        {
-            Assert.Equal(0d, actual);
-            return;
-        }
-
+        // No escape for actual == 0: that is exactly what the old (always-UTC) host
+        // implementation returned, and the Makefile always links --wrap=__secs_to_zone.
         Assert.Equal(expected, actual);
     }
 

@@ -93,9 +93,15 @@ internal static class ValueMarshalling
         if (handle.IsObject)
         {
             using var keysHandle = new JSValueHandle(vm, e.GetOwnPropertyNames(handle.Ptr));
+            var dict = new Dictionary<string, object?>(StringComparer.Ordinal);
+            if (keysHandle.IsException)
+            {
+                // Enumeration threw (e.g. a Proxy ownKeys trap): dump as an empty object, like TS.
+                return dict;
+            }
+
             using var lengthHandle = keysHandle.GetProp("length");
             var length = Convert.ToInt32(lengthHandle.ToNumber());
-            var dict = new Dictionary<string, object?>(StringComparer.Ordinal);
             var valuePtr = e.GetValuePtr(handle.Ptr);
             if (valuePtr != 0)
             {

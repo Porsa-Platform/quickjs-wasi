@@ -66,7 +66,68 @@ public sealed class JSValueHandle : IDisposable
     public bool IsWeakSet => Vm.Exports.IsWeakSet(Ptr) != 0;
     public bool IsDataView => Vm.Exports.IsDataView(Ptr) != 0;
     public int ClassId => Vm.Exports.GetClassId(Ptr);
+
+    /// <summary>
+    /// The engine-level class name of this value, e.g. <c>"Object"</c>, <c>"Map"</c>,
+    /// <c>"Date"</c>, or <c>null</c> for non-objects and unnamed internal classes.
+    ///
+    /// Unlike <see cref="ConstructorName"/>, this reads the engine's class table: it never
+    /// runs guest code and cannot be spoofed by reassigning prototypes or constructors.
+    /// Proxies report <c>"Object"</c>; use <see cref="IsProxy"/> to detect them.
+    /// </summary>
+    /// <exception cref="JSException">The engine failed to materialise the name (e.g. out of memory).</exception>
+    public string? ClassName
+    {
+        get
+        {
+            using var name = new JSValueHandle(Vm, Vm.Exports.GetClassName(Ptr));
+            if (name.IsException)
+            {
+                throw new JSException(Vm.GetException());
+            }
+
+            return name.IsUndefined ? null : name.ToManagedString();
+        }
+    }
+
     public int PromiseState => Vm.Exports.PromiseState(Ptr);
+
+    /// <summary>The <c>typeof</c> of this value, as the JavaScript operator would report it.</summary>
+    public string TypeOf => Vm.TypeOf(this);
+
+    /// <summary>
+    /// The <c>name</c> of this value's <c>constructor</c>, or <c>null</c> if unavailable.
+    /// Reads properties, so it can run getters and proxy traps; prefer <see cref="ClassName"/>
+    /// for a trap-free brand.
+    /// </summary>
+    public string? ConstructorName
+    {
+        get
+        {
+            using var ctor = GetProp("constructor");
+            if (ctor.IsUndefined || ctor.IsNull)
+            {
+                return null;
+            }
+
+            using var name = ctor.GetProp("name");
+            return name.IsUndefined || name.IsNull ? null : name.ToManagedString();
+        }
+    }
+
+    /// <summary>Use this handle, then dispose it. Returns the callback's result.</summary>
+    public T Consume<T>(Func<JSValueHandle, T> fn)
+    {
+        ArgumentNullException.ThrowIfNull(fn);
+        try
+        {
+            return fn(this);
+        }
+        finally
+        {
+            Dispose();
+        }
+    }
 
     public JSValueHandle Dup() => new(Vm, Vm.Exports.DupValue(Ptr));
 
@@ -148,9 +209,28 @@ public sealed class JSValueHandle : IDisposable
         }
     }
 
+    /// <summary>
+    /// Define a property with an arbitrary key (string or symbol handle), matching
+    /// <c>Object.defineProperty()</c>. All flags default to <c>false</c>.
+    /// </summary>
+    public void DefineProp(JSValueHandle key, JSValueHandle value, bool configurable = false, bool writable = false, bool enumerable = false)
+    {
+        var flags = (configurable ? 1 : 0) | (writable ? 2 : 0) | (enumerable ? 4 : 0);
+        Vm.ThrowOnNegative(Vm.Exports.DefinePropValue(Ptr, key.Ptr, value.Ptr, flags));
+    }
+
+    /// <summary>
+    /// Own enumerable string property names (equivalent to <c>Object.keys()</c>).
+    /// Returns an empty array if enumeration throws (e.g. a Proxy <c>ownKeys</c> trap).
+    /// </summary>
     public string[] Keys()
     {
         using var names = new JSValueHandle(Vm, Vm.Exports.GetOwnPropertyNames(Ptr));
+        if (names.IsException)
+        {
+            return Array.Empty<string>();
+        }
+
         using var lengthHandle = names.GetProp("length");
         var length = Convert.ToInt32(lengthHandle.ToNumber());
         var result = new string[length];
@@ -284,13 +364,14 @@ public sealed class JSValueHandle : IDisposable
         if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
         {
             using var keyHandle = Vm.NewString(name);
-            return Vm.Exports.HasOwnPropertyValue(Ptr, keyHandle.Ptr) != 0;
+            return Vm.Exports.HasOwnPropertyValue(Ptr, keyHandle.Ptr) == 1;
         }
 
         var written = Vm.WriteString(name);
         try
         {
-            return Vm.Exports.HasOwnProperty(Ptr, written.Ptr) != 0;
+            // -1 (error) reads as false, like the TypeScript host.
+            return Vm.Exports.HasOwnProperty(Ptr, written.Ptr) == 1;
         }
         finally
         {
@@ -303,13 +384,14 @@ public sealed class JSValueHandle : IDisposable
         if (WasmMemoryAccessor.StringKeyNeedsValuePath(name))
         {
             using var keyHandle = Vm.NewString(name);
-            return Vm.Exports.PropertyIsEnumerableValue(Ptr, keyHandle.Ptr) != 0;
+            return Vm.Exports.PropertyIsEnumerableValue(Ptr, keyHandle.Ptr) == 1;
         }
 
         var written = Vm.WriteString(name);
         try
         {
-            return Vm.Exports.PropertyIsEnumerable(Ptr, written.Ptr) != 0;
+            // -1 (error) reads as false, like the TypeScript host.
+            return Vm.Exports.PropertyIsEnumerable(Ptr, written.Ptr) == 1;
         }
         finally
         {
@@ -318,8 +400,30 @@ public sealed class JSValueHandle : IDisposable
     }
 
     public JSValueHandle GetPrototypeOf() => new(Vm, Vm.Exports.GetPrototypeOf(Ptr));
-    public JSValueHandle GetProxyTarget() => new(Vm, Vm.Exports.GetProxyTarget(Ptr));
-    public JSValueHandle GetProxyHandler() => new(Vm, Vm.Exports.GetProxyHandler(Ptr));
+    /// <summary>
+    /// The <c>[[ProxyTarget]]</c> of this Proxy, read without firing any traps.
+    /// Check <see cref="IsProxy"/> first; the target may itself be a Proxy.
+    /// </summary>
+    /// <exception cref="JSException">This value is not a Proxy.</exception>
+    public JSValueHandle GetProxyTarget() => ThrowIfException(new JSValueHandle(Vm, Vm.Exports.GetProxyTarget(Ptr)));
+
+    /// <summary>
+    /// The <c>[[ProxyHandler]]</c> of this Proxy, read without firing any traps.
+    /// Check <see cref="IsProxy"/> first.
+    /// </summary>
+    /// <exception cref="JSException">This value is not a Proxy.</exception>
+    public JSValueHandle GetProxyHandler() => ThrowIfException(new JSValueHandle(Vm, Vm.Exports.GetProxyHandler(Ptr)));
+
+    private JSValueHandle ThrowIfException(JSValueHandle handle)
+    {
+        if (!handle.IsException)
+        {
+            return handle;
+        }
+
+        handle.Dispose();
+        throw new JSException(Vm.GetException());
+    }
     public double ToNumber() => Vm.Exports.GetFloat64(Ptr);
     public bool ToBool() => ToBoolean();
 
@@ -367,19 +471,28 @@ public sealed class JSValueHandle : IDisposable
 
     public byte[] ToByteArray()
     {
-        var lengthPtr = Vm.Exports.WasmMalloc(4);
-        try
+        // Only call JS_GetArrayBuffer on an ArrayBuffer: on anything else it throws a
+        // TypeError that would be left pending on the context.
+        if (IsArrayBuffer)
         {
-            var dataPtr = Vm.Exports.GetArrayBuffer(Ptr, lengthPtr);
-            if (dataPtr != 0)
+            var lengthPtr = Vm.Exports.WasmMalloc(4);
+            try
             {
+                var dataPtr = Vm.Exports.GetArrayBuffer(Ptr, lengthPtr);
                 var length = WasmMemoryAccessor.ReadInt32(Vm.Exports.Memory, lengthPtr);
+                if (dataPtr == 0)
+                {
+                    return length == 0
+                        ? Array.Empty<byte>()
+                        : throw new InvalidOperationException("Unable to read ArrayBuffer data.");
+                }
+
                 return WasmMemoryAccessor.ReadBytes(Vm.Exports.Memory, dataPtr, length);
             }
-        }
-        finally
-        {
-            Vm.Exports.WasmFree(lengthPtr);
+            finally
+            {
+                Vm.Exports.WasmFree(lengthPtr);
+            }
         }
 
         var byteOffsetPtr = Vm.Exports.WasmMalloc(4);

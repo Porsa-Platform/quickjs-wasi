@@ -127,7 +127,7 @@ using var vm = await QuickJs.CreateAsync();
 using var vm = await QuickJs.CreateAsync(new QuickJsOptions
 {
     MemoryLimit   = 32 * 1024 * 1024,  // 32 MB JS heap
-    MaxStackSize  = 4 * 1024 * 1024,   // 4 MB call stack
+    MaxStackSize  = 256 * 1024,        // 256 KB JS stack (max QuickJs.MAX_STACK_SIZE)
     TimezoneOffset = TimezoneOffsetOption.Host,
 });
 ```
@@ -344,7 +344,16 @@ handle.IsWeakSet     // engine-level WeakSet brand check
 handle.IsDataView    // engine-level DataView brand check
 handle.IsException   // value is an internal JS exception sentinel
 handle.ClassId       // raw QuickJS class ID (advanced use)
+handle.ClassName     // engine class name, e.g. "Map" (trap-free, cannot be spoofed); null for primitives
+handle.ConstructorName // constructor.name (reads properties: may run getters / proxy traps)
+handle.TypeOf        // same as vm.TypeOf(handle)
 handle.PromiseState  // 0 = pending, 1 = fulfilled, 2 = rejected
+```
+
+`Consume` uses a handle and disposes it in one step:
+
+```csharp
+double n = vm.Eval("6 * 7").Consume(h => h.ToNumber()); // 42, handle disposed
 ```
 
 Example — safe value extraction:
@@ -811,7 +820,8 @@ using var vm = await QuickJs.CreateAsync(new QuickJsOptions
 });
 ```
 
-Set to `0` to disable the QuickJS stack guard entirely.
+Set to `0` to disable the QuickJS stack guard entirely. Values outside `0`…`QuickJs.MAX_STACK_SIZE`
+throw `ArgumentOutOfRangeException` from `CreateAsync` / `RestoreAsync`.
 
 ### 13.3 Garbage collection
 
@@ -923,7 +933,8 @@ Available flags:
 Control the timezone offset used by `Date` inside the sandbox:
 
 ```csharp
-// Mirror the host machine's local timezone (default)
+// Mirror the host machine's local timezone, DST included (default).
+// Before 1.4.0 this was always UTC regardless of the host timezone.
 TimezoneOffset = TimezoneOffsetOption.Host
 
 // Fixed UTC offset (minutes west of UTC, same sign convention as Date.getTimezoneOffset())
@@ -1019,8 +1030,9 @@ vm2.Eval("log('hello from restored VM')"); // prints "Restored: hello from resto
 ## 17. Version information
 
 ```csharp
-IReadOnlyDictionary<string, string> versions = vm.Versions;
-Console.WriteLine(versions["quickjs"]); // e.g. "0.8.0"
+IReadOnlyDictionary<string, string> versions = vm.Versions; // cached
+Console.WriteLine(versions["quickjs-wasi"]); // QuickJsWasi package version, e.g. "1.4.0"
+Console.WriteLine(versions["quickjs"]);      // QuickJS-NG engine version, e.g. "0.17.0"
 ```
 
 ---
@@ -1078,7 +1090,8 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `EvalBytecode(bytecode)`                              | Execute compiled bytecode                                  |
 | `ExecutePendingJobs()`                                | Run the microtask queue; returns job count                 |
 | `ExecutePendingJobsAsync(cancellationToken?)`         | Run jobs and await in-flight async host tasks until drained |
-| `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>`         |
+| `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>` (trap-free subscription) |
+| `MarkPromiseHandled(promise)`                         | Suppress `OnUnhandledRejection` for a promise              |
 | `CallFunction(func, thisVal, args...)`                | Call a JS function; throws on exception                    |
 | `NewString(value)`                                    | Create a JS string                                         |
 | `NewNumber(value)`                                    | Create a JS number                                         |
@@ -1108,7 +1121,8 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `Global`                                              | The global object (singleton, do not dispose)              |
 | `UndefinedValue / NullValue / TrueValue / FalseValue` | Cached singletons (do not dispose)                         |
 | `GcThreshold`                                         | Get/set the auto-GC threshold in bytes                     |
-| `Versions`                                            | `{ "quickjs": "x.y.z" }`                                   |
+| `Versions`                                            | `{ "quickjs-wasi": …, "quickjs": … }` (cached)             |
+| `MAX_STACK_SIZE`                                      | Upper bound for `QuickJsOptions.MaxStackSize` (512 KiB)    |
 | `IsDisposed`                                          | Whether the VM has been disposed                           |
 | `Dispose()`                                           | Release all WASM resources                                 |
 
@@ -1121,16 +1135,18 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `SetProp(name, value)`                                    | Set property by string name                          |
 | `SetProp(key, value)`                                     | Set property by symbol key                           |
 | `DefineProp(name, value, …)`                              | Define property with explicit descriptor flags       |
-| `Keys()`                                                  | Enumerable own string property names                 |
+| `DefineProp(key, value, …)`                               | Same, with a string or symbol key handle             |
+| `Keys()`                                                  | Enumerable own string property names (`[]` if enumeration throws) |
 | `GetOwnPropertyNames()`                                   | All own string property names (incl. non-enumerable) |
 | `GetOwnPropertyKeys()`                                    | All own keys including symbols (`Reflect.ownKeys()`) |
 | `GetOwnPropertyDescriptor(key)`                           | Property descriptor without invoking getters         |
 | `HasOwnProperty(name)`                                    | `Object.prototype.hasOwnProperty`                    |
 | `PropertyIsEnumerable(name)`                              | `Object.prototype.propertyIsEnumerable`              |
 | `GetPrototypeOf()`                                        | Get the prototype                                    |
-| `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free)                    |
-| `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free)                   |
+| `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free; `JSException` if not a proxy) |
+| `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free; `JSException` if not a proxy) |
 | `Dup()`                                                   | Duplicate (increment refcount)                       |
+| `Consume(fn)`                                             | Run `fn(handle)`, then dispose the handle            |
 | `Length`                                                  | UTF-16 code unit count (strings) or element count (arrays) |
 | `Identity`                                                | Numeric pointer identity — same for two handles of the same object |
 | `ToNumber()`                                              | Extract as `double`                                  |
@@ -1140,6 +1156,9 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `IsUndefined / IsNull / IsBool / IsNumber / IsString / …` | Type checks                                          |
 | `PromiseState`                                            | 0 = pending, 1 = fulfilled, 2 = rejected             |
 | `ClassId`                                                 | Raw QuickJS class ID                                 |
+| `ClassName`                                               | Engine class name (trap-free), or `null`             |
+| `ConstructorName`                                         | `constructor.name`, or `null` (may run guest code)   |
+| `TypeOf`                                                  | The `typeof` string                                  |
 | `Dispose()`                                               | Free the JS value                                    |
 
 ### `QuickJsOptions`

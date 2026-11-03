@@ -69,8 +69,10 @@ public abstract record TimezoneOffsetOption
 
     private sealed record HostTimezoneOffsetOption : TimezoneOffsetOption
     {
+        // The host's local offset at that instant (DST-aware). DateTimeOffset.FromUnixTimeSeconds
+        // alone is always UTC, which made every VM run in UTC.
         internal override int ResolveSeconds(long epochSeconds)
-            => (int)DateTimeOffset.FromUnixTimeSeconds(epochSeconds).Offset.TotalSeconds;
+            => (int)TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.FromUnixTimeSeconds(epochSeconds)).TotalSeconds;
     }
 
     private sealed record FixedTimezoneOffsetOption(int MinutesWestOfUtc) : TimezoneOffsetOption

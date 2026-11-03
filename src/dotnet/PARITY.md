@@ -7,20 +7,30 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 - **Status keys:** ✅ ported · ⚠️ ported, behaves differently · ❌ missing · ➕ .NET-only.
 - When you port an upstream change, update the matching row and the [upstream sync log](#upstream-sync-log).
 
-## Open gaps (prioritised)
+## Open gaps
 
 | # | Gap | TS | .NET | Status |
 |---|---|---|---|---|
-| 1 | `TimezoneOffsetOption.Host` is always UTC | `-new Date(t*1000).getTimezoneOffset()*60` (index.ts ~986) | `DateTimeOffset.FromUnixTimeSeconds(s).Offset` is always zero (QuickJsOptions.cs `HostTimezoneOffsetOption`). Should use `TimeZoneInfo.Local.GetUtcOffset(...)`. `Timezone_HostOffset` has an `actual == 0` escape that hides this. | ⚠️ bug |
-| 2 | `ResolvePromise` can run guest code | Subscribes with engine-level `qjs_promise_then`, which ignores patched `then` / `Symbol.species` | Uses `Promise.prototype.then` captured on first use (`GetPromiseThen`). A patch made before the first call is captured, and `Symbol.species` is consulted. The `PromiseThen` wrapper exists but is unused. | ⚠️ |
-| 3 | Missing exception checks | `getProxyTarget`/`getProxyHandler` throw `JSException`; `keys()` returns `[]`; `dump` returns `{}` | `GetProxyTarget`/`GetProxyHandler`, `Keys()` and `Dump` of objects use the exception sentinel. The guest TypeError stays pending. | ⚠️ |
-| 4 | `HasOwnProperty` / `PropertyIsEnumerable` on error | `=== 1`, so an error reads as `false` | `!= 0`, so an error (-1) reads as `true` | ⚠️ |
-| 5 | `Deferred.Settled` timing | Completes when the guest promise settles | Completes when the host calls `Resolve`/`Reject`, even when resolving with a pending thenable | ⚠️ |
-| 6 | Missing APIs | `className`, `constructorName`, `typeof` (handle getter), `consume`, `markPromiseHandled`, `getGlobal()`…`getFalse()`, `defineProp` with symbol/handle key, `MAX_STACK_SIZE` and `maxStackSize` RangeError validation | — (`GetClassName` and `PromiseMarkAsHandled` wrappers exist but are unused) | ❌ |
-| 7 | Extensions and WASI overrides | `extensions` option, `loadExtension`/`restoreExtensions`; `wasi` option | No extension loading. `RestoreAsync` rejects snapshots that have extensions. `WasiShim` is hard-coded (subclassing isn't reachable from options). | ❌ |
-| 8 | `ToByteArray` on typed arrays | Checks `qjs_is_array_buffer` first | Calls `GetArrayBuffer` first; on a typed array this leaves a pending TypeError before falling back | ⚠️ |
-| 9 | Disposed-VM guarding | `assertNotDisposed()` on nearly every method | `ObjectDisposedException` only in `Construct`, `WithScope`, `NewEphemeralFunction`, `ExecutePendingJobsAsync` and the task bridge | ⚠️ |
-| 10 | `Versions` | `quickjs`, `quickjs-wasi`, plus extension versions; cached | `quickjs` only; not cached | ⚠️ |
+| 7 | Extensions and WASI overrides | `extensions` option, `loadExtension`/`restoreExtensions`; `wasi` option | No extension loading (dylink parsing, memory/table bases, `qjs_ext_*_init`). `RestoreAsync` rejects snapshots that have extensions. `WasiShim` is hard-coded (subclassing isn't reachable from options). Needs its own port. | ❌ |
+| 11 | `getGlobal()` … `getFalse()` methods | Methods alongside the cached getters | Only the `Global` / `UndefinedValue` / … properties | ❌ by design: the properties cover it |
+
+Gap numbers are kept stable so commits and issues can refer to them.
+
+### Resolved in 1.4.0
+
+Tests are in `QuickJsWasi.Tests/ParityTests.cs` unless noted.
+
+| # | Gap | Fix |
+|---|---|---|
+| 1 | `TimezoneOffsetOption.Host` was always UTC | Uses `TimeZoneInfo.Local.GetUtcOffset(...)`, so it's DST-aware. **Behavior change:** the default VM now uses the host timezone, as in TS. Removed the `actual == 0` escape from `Timezone_HostOffset`. |
+| 2 | `ResolvePromise` subscribed via guest-visible `Promise.prototype.then` | Subscribes via `qjs_promise_then` (`PromiseThenRaw`), so patched `then` / `Symbol.species` are never consulted. Ported test: "cannot be intercepted by patching". |
+| 3 | Missing exception checks | `GetProxyTarget` / `GetProxyHandler` throw `JSException`; `Keys()` returns `[]`; `Dump` of an object whose enumeration throws returns an empty dictionary. |
+| 4 | `HasOwnProperty` / `PropertyIsEnumerable` read errors as `true` | Compare `== 1`, so an error reads as `false`. |
+| 5 | `Deferred.Settled` completed when the host called `Resolve`/`Reject` | Lazily subscribes to the guest promise (trap-free) and completes when it actually settles. |
+| 6 | Missing APIs | Added `ClassName`, `ConstructorName`, `TypeOf` (handle property), `Consume`, `MarkPromiseHandled`, `DefineProp(JSValueHandle key, …)`, `QuickJs.MAX_STACK_SIZE` with `MaxStackSize` validation (`ArgumentOutOfRangeException`). |
+| 8 | `ToByteArray` left a pending TypeError on typed arrays | Checks `IsArrayBuffer` first; an empty `ArrayBuffer` returns `[]`. |
+| 9 | Inconsistent disposed-VM guarding | Public `QuickJs` members throw `ObjectDisposedException` after `Dispose()`. |
+| 10 | `Versions` had no package key and wasn't cached | Adds `quickjs-wasi` (the .NET package version) and caches the dictionary. |
 
 **Intentional .NET differences (no action needed):**
 - Errors use idiomatic .NET exception types where TS throws a plain `Error`. For example, `Compile` and `ExecutePendingJobs` throw `JSException`, and invalid arguments throw `InvalidOperationException` / `ArgumentOutOfRangeException`.
@@ -36,9 +46,9 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 |---|---|---|
 | `create` / `restore` | `CreateAsync` / `RestoreAsync` | ⚠️ `QuickJsOptions` only; falls back to the embedded wasm. Restore rejects extensions. |
 | `serializeSnapshot` / `deserializeSnapshot` | `Snapshot.Serialize` / `Snapshot.Deserialize` | ✅ Same binary format (v1/v2) |
-| `versions` | `Versions` | ⚠️ Gap 10 |
+| `versions` | `Versions` | ✅ `quickjs-wasi` + `quickjs`, cached (no extension versions, Gap 7) |
 | `global` / `undefined` / `null` / `true` / `false` | `Global` / `UndefinedValue` / `NullValue` / `TrueValue` / `FalseValue` | ✅ (created eagerly) |
-| `getGlobal()` … `getFalse()` | — | ❌ (use the properties) |
+| `getGlobal()` … `getFalse()` | — | ❌ by design (Gap 11): use the properties |
 | `evalCode` / `compile` / `evalBytecode` | `Eval` / `Compile` / `EvalBytecode` | ✅ |
 | `executePendingJobs` | `ExecutePendingJobs` | ⚠️ Also delivers completed async host tasks |
 | — | `ExecutePendingJobsAsync(CancellationToken)` | ➕ Awaits in-flight async host tasks until drained |
@@ -51,11 +61,11 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 | `newEphemeralFunction` / `registerHostCallback` / `unregisterHostCallback` | same (+ async overloads ➕) | ✅ |
 | `withScope` | `WithScope<T>` | ✅ |
 | `exportHandle` / `importHandle` | same | ✅ |
-| `newPromise` → `Deferred` | `NewPromise` → `Deferred` | ⚠️ Gap 5 |
-| `resolvePromise` | `ResolvePromise` → `Task<JSPromiseResult>` | ⚠️ Gap 2 |
-| `markPromiseHandled` | — | ❌ |
+| `newPromise` → `Deferred` | `NewPromise` → `Deferred` | ✅ |
+| `resolvePromise` | `ResolvePromise` → `Task<JSPromiseResult>` | ✅ Trap-free (`qjs_promise_then`) |
+| `markPromiseHandled` | `MarkPromiseHandled` | ✅ |
 | `callFunction` / `construct` | `CallFunction` / `Construct` | ✅ |
-| `setProp` / `defineProp` / `getProp` (on the VM) | instance methods on `JSValueHandle` | ⚠️ `DefineProp` takes string keys only |
+| `setProp` / `defineProp` / `getProp` (on the VM) | instance methods on `JSValueHandle` | ✅ (string or handle keys) |
 | `getException` | `GetException` (+ `GetPromiseResult` ➕) | ✅ |
 | `newError` | `NewError(Exception)` / `NewError(string)` | ⚠️ `name` is the .NET type name |
 | `typeof` / `dump` / `hostToHandle` | `TypeOf` / `Dump` / `HostToHandle` (+ `Task` overloads ➕) | ⚠️ See [Marshalling](#marshalling) |
@@ -66,25 +76,25 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 | TS | .NET | Status |
 |---|---|---|
 | 22 `is*` brand getters, `identity`, `toBoolean`, `classId`, `promiseState`, `dup`, `dispose`, `disposed` | same | ✅ (`IsException`, `ToBool` ➕) |
-| `className` / `constructorName` / `typeof` / `consume` | — | ❌ |
+| `className` / `constructorName` / `typeof` / `consume` | `ClassName` / `ConstructorName` / `TypeOf` / `Consume` | ✅ (`null` instead of `undefined`) |
 | `length` | `Length` (`int`) | ✅ |
-| `keys()` | `Keys()` | ⚠️ Gap 3 |
+| `keys()` | `Keys()` | ✅ |
 | `getOwnPropertyNames` / `getOwnPropertyKeys` / `getOwnPropertyDescriptor` | same | ✅ (`null` instead of `undefined`) |
-| `hasOwnProperty` / `propertyIsEnumerable` | same | ⚠️ Gap 4 |
+| `hasOwnProperty` / `propertyIsEnumerable` | same | ✅ |
 | `getPrototypeOf` | same | ✅ |
-| `getProxyTarget` / `getProxyHandler` | same | ⚠️ Gap 3 |
-| `getProp` / `setProp` / `defineProp` | same | ✅ / ⚠️ (`DefineProp` has no handle-key overload) |
-| `toNumber` / `toBigInt` / `toArrayBuffer` / `toUint8Array` / `toString` | `ToNumber` / `ToInt64` / `ToByteArray` / `ToManagedString` | ✅ / ⚠️ Gap 8 |
+| `getProxyTarget` / `getProxyHandler` | same | ✅ |
+| `getProp` / `setProp` / `defineProp` | same | ✅ |
+| `toNumber` / `toBigInt` / `toArrayBuffer` / `toUint8Array` / `toString` | `ToNumber` / `ToInt64` / `ToByteArray` / `ToManagedString` | ✅ |
 
 ### Other types and constants
 
 | TS | .NET | Status |
 |---|---|---|
 | `JSException` | `JSException` | ✅ (`Handle`, `Name`, `JsStack`; `StackTrace` returns the JS stack) |
-| `Deferred` | `Deferred` | ✅ Settle-once and release-both-resolvers (upstream #56); ⚠️ Gap 5 |
+| `Deferred` | `Deferred` | ✅ Settle-once, release-both-resolvers (upstream #56); `Settled` tracks the guest promise |
 | `HandleScope`, `JSOwnPropertyDescriptor`, `MemoryUsage`, `Snapshot`, `SnapshotExtension` | same | ✅ |
 | `EvalFlags`, `CompileFlags`, `Intrinsics` | same | ✅ |
-| `MAX_STACK_SIZE` | — | ❌ |
+| `MAX_STACK_SIZE` | `QuickJs.MAX_STACK_SIZE` | ✅ |
 | `JSPropertyDescriptor` | bool parameters on `DefineProp` | ⚠️ |
 | `ExtensionDescriptor`, `LoadedExtension`, `WasiOptions`, … | — | ❌ Gap 7 |
 
@@ -94,15 +104,15 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 |---|---|---|
 | `wasm` | `WasmBytes` | ✅ (`byte[]`; embedded fallback) |
 | `memoryLimit` / `interruptHandler` / `onUnhandledRejection` / `moduleLoader` / `intrinsics` | same | ✅ |
-| `maxStackSize` | `MaxStackSize` | ⚠️ No range validation |
-| `timezoneOffset` | `TimezoneOffset` (`Host` / `Fixed` / `Callback`) | ⚠️ Gap 1 |
+| `maxStackSize` | `MaxStackSize` | ✅ Range-checked (`ArgumentOutOfRangeException` instead of `RangeError`) |
+| `timezoneOffset` | `TimezoneOffset` (`Host` / `Fixed` / `Callback`) | ✅ |
 | `wasi` / `extensions` | — | ❌ Gap 7 |
 
 ## WASM exports
 
 - `c/interface.c` exports 104 `qjs_*` / `wasm_*` functions.
 - `Interop/NativeExports.cs` wraps all of them, plus `_initialize`. No wrapper calls an export that doesn't exist.
-- Wrappers that nothing calls: `Destroy`, `GetString` and `TypeOf` (TS doesn't use these either), and `GetClassName`, `PromiseThen` and `PromiseMarkAsHandled` (gaps 2 and 6).
+- Wrappers that nothing calls: `Destroy`, `GetString` and `TypeOf`. TS doesn't use these either.
 - Host imports (`env.host_*`, WASI) are all defined. .NET also defines `proc_exit` (unused).
 - A missing export throws `InvalidOperationException` naming the stale `quickjs.wasm`. Rebuild it with `make quickjs.wasm`; on Windows, run `make setup` first.
 
@@ -113,7 +123,7 @@ reference implementation. This document tracks how the .NET host (`src/dotnet/Qu
 | `clock_time_get` | Realtime ms for ids 0/1; other ids `NOSYS` | Monotonic `Stopwatch` for id 1; realtime otherwise ⚠️ |
 | `fd_write`, `fd_fdstat_get`, `fd_close`, `fd_seek`, `random_get` | — | ✅ |
 | User override (`wasi` option) | ✅ | ❌ |
-| Timezone `'host'` | Real local offset | ⚠️ Always UTC (Gap 1) |
+| Timezone `'host'` | Real local offset | ✅ Real local offset, DST-aware |
 
 ## Marshalling
 
@@ -136,7 +146,8 @@ Mapping of `test/*.test.ts` to `src/dotnet/QuickJsWasi.Tests`:
 |---|---|
 | lossless-strings, portable-handles, promise-retention, eval "module completion" | ✅ full (`LosslessStringTests`, `PortableHandleTests`, `PromiseRetentionTests`, `ModuleCompletionTests`) |
 | eval, functions, handle-lifetime, introspection, values, promises, snapshot, limits, symbols, bytecode, binary | Partial (core paths only) |
-| memory-growth, promise-rejection, gc, gc-threshold edge cases, timezone fixed/callback, module-loader (13 of 14), intrinsics (17 of 18), base64, wasi | ❌ Not ported; portable without new APIs, except `markPromiseHandled` and the `wasi` option |
+| Parity fixes (promises interception, `markPromiseHandled`, proxy introspection, className, timezone host/fixed/callback, `maxStackSize` range, versions) | ✅ `ParityTests` |
+| memory-growth, promise-rejection (`onUnhandledRejection` cases), gc, gc-threshold edge cases, module-loader (13 of 14), intrinsics (17 of 18), base64, wasi | ❌ Not ported; portable without new APIs, except the `wasi` option |
 | extensions, crypto, encoding, headers, structured-clone, wpt-*, devalue-round-trip | ❌ Need extension support (Gap 7) |
 | Async host bridge, `ExecutePendingJobsAsync`, `HostToHandle(Task)`, POCO marshalling | ➕ .NET-only |
 
