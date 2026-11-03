@@ -28,6 +28,14 @@ public sealed class QuickJs : IDisposable
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<int, PendingTaskBridge> _pendingTaskBridges = new();
+
+    /// <summary>IDs of bridged tasks that have completed but not yet been delivered to the guest.</summary>
+    private readonly ConcurrentQueue<int> _completedTaskBridges = new();
+
+    /// <summary>Signalled when a bridged task completes; replaced by each waiter of <see cref="ExecutePendingJobsAsync"/>.</summary>
+    private TaskCompletionSource _taskBridgeCompleted = NewTaskBridgeSignal();
+
+    private static readonly ConcurrentDictionary<Type, System.Reflection.PropertyInfo?> TaskResultProperties = new();
     private readonly WasiShim _wasi;
     private bool _disposed;
     private int _nextInternalId;
@@ -467,13 +475,16 @@ public sealed class QuickJs : IDisposable
 
     public int ExecutePendingJobs()
     {
-        var count = 0;
+        // Full scans (start, and once the job queue is empty) deliver every task already
+        // complete at call time even if its completion callback has not run yet; between
+        // jobs only the completion queue is drained, so cost is O(in flight + jobs).
+        var count = DrainCompletedTaskBridges(scanAll: true);
         while (true)
         {
-            count += DrainCompletedTaskBridges();
+            count += DrainCompletedTaskBridges(scanAll: false);
             if (Exports.IsJobPending() == 0)
             {
-                var moreCompleted = DrainCompletedTaskBridges();
+                var moreCompleted = DrainCompletedTaskBridges(scanAll: true);
                 count += moreCompleted;
                 if (moreCompleted == 0)
                 {
@@ -523,8 +534,15 @@ public sealed class QuickJs : IDisposable
         var count = ExecutePendingJobs();
         while (!_pendingTaskBridges.IsEmpty)
         {
-            var pending = _pendingTaskBridges.Values.Select(bridge => bridge.Task).ToArray();
-            await Task.WhenAny(pending).WaitAsync(cancellationToken).ConfigureAwait(false);
+            var signal = Volatile.Read(ref _taskBridgeCompleted);
+            if (_completedTaskBridges.IsEmpty)
+            {
+                // A completion racing this check enqueues first and then signals the
+                // current TaskCompletionSource, which is `signal`, so it cannot be missed.
+                await signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            Interlocked.CompareExchange(ref _taskBridgeCompleted, NewTaskBridgeSignal(), signal);
             if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
             count += ExecutePendingJobs();
         }
@@ -1057,24 +1075,49 @@ public sealed class QuickJs : IDisposable
         _engine.Dispose();
     }
 
-    private int DrainCompletedTaskBridges()
+    private int DrainCompletedTaskBridges(bool scanAll)
     {
+        // The queue only holds completed bridges, so draining it costs O(completed).
+        // A task can report IsCompleted before its completion callback has enqueued it
+        // (e.g. a TaskCompletionSource with RunContinuationsAsynchronously), so callers
+        // that must see every completed task pass scanAll, which costs O(in flight).
         var count = 0;
-        foreach (var entry in _pendingTaskBridges)
+        while (_completedTaskBridges.TryDequeue(out var bridgeId))
         {
-            if (!entry.Value.Task.IsCompleted)
-            {
-                continue;
-            }
+            count += TryCompleteTaskBridge(bridgeId);
+        }
 
-            if (_pendingTaskBridges.TryRemove(entry.Key, out var pending))
+        if (scanAll)
+        {
+            foreach (var entry in _pendingTaskBridges)
             {
-                CompleteDeferredFromTask(pending.Task, pending.Deferred);
-                count++;
+                if (entry.Value.Task.IsCompleted)
+                {
+                    count += TryCompleteTaskBridge(entry.Key);
+                }
             }
         }
 
         return count;
+    }
+
+    private int TryCompleteTaskBridge(int bridgeId)
+    {
+        if (!_pendingTaskBridges.TryRemove(bridgeId, out var pending))
+        {
+            return 0;
+        }
+
+        CompleteDeferredFromTask(pending.Task, pending.Deferred);
+        return 1;
+    }
+
+    private static TaskCompletionSource NewTaskBridgeSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void OnTaskBridgeCompleted(int bridgeId)
+    {
+        _completedTaskBridges.Enqueue(bridgeId);
+        Volatile.Read(ref _taskBridgeCompleted).TrySetResult();
     }
 
     private HostFunction WrapAsyncHostAction(AsyncHostAction callback)
@@ -1122,6 +1165,16 @@ public sealed class QuickJs : IDisposable
 
         var bridgeId = Interlocked.Increment(ref _nextPendingTaskBridgeId);
         _pendingTaskBridges[bridgeId] = new PendingTaskBridge(task, deferred);
+        task.ContinueWith(
+            static (_, state) =>
+            {
+                var (vm, id) = ((QuickJs, int))state!;
+                vm.OnTaskBridgeCompleted(id);
+            },
+            (this, bridgeId),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
         return deferred.Handle;
     }
@@ -1167,8 +1220,19 @@ public sealed class QuickJs : IDisposable
 
     private static bool TryGetTaskResult(Task task, out object? result)
     {
-        var property = task.GetType().GetProperty("Result");
-        if (property is null || property.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult")
+        // Fast path: AsyncHostFunction callbacks return Task<object?>.
+        if (task is Task<object?> objectTask)
+        {
+            result = objectTask.Result;
+            return true;
+        }
+
+        var property = TaskResultProperties.GetOrAdd(task.GetType(), static type =>
+        {
+            var p = type.GetProperty("Result");
+            return p is null || p.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult" ? null : p;
+        });
+        if (property is null)
         {
             result = null;
             return false;

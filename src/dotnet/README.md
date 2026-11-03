@@ -1349,7 +1349,7 @@ cd src/dotnet
 dotnet run --configuration Release --project QuickJsWasi.Benchmarks
 ```
 
-The suite covers every major use case: VM creation, eval, bytecode compilation, host function dispatch, string transport, property operations, value marshalling, snapshot capture/restore, portable handles, and promise resolution.
+The suite covers every major use case: VM creation, eval, bytecode compilation, host function dispatch, string transport, property operations, value marshalling, snapshot capture/restore, portable handles, promises, and the async host bridge. Pass BenchmarkDotNet arguments after `--` to narrow it, e.g. `-- --filter "*AsyncBridge*"`.
 
 ### Results
 
@@ -1386,6 +1386,29 @@ Measured on Ubuntu 22.04 x64 · .NET 10.0 · Intel Xeon Platinum 8370C @ 2.80 GH
 | Promise — resolve + await | 31 μs | 2.4 KB |
 
 > **Note:** Cold-start cost is dominated by Wasmtime WASM module instantiation and is paid once per `QuickJs.CreateAsync()` call. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
+
+### Promises and the async host bridge
+
+Measured on Windows 11 · .NET 10.0 · Intel Core i7-11370H · `BenchmarkDotNet v0.15.8` (`--job short`).
+Run only these with `--filter "*Promise_*" "*AsyncHost_*" "*AsyncBridge*"`.
+
+| Benchmark | Mean | Alloc |
+|---|---|---|
+| Promise — guest-only await chain ×1 000 | 1.91 ms | 49 KB |
+| Promise — Deferred create + resolve from .NET | 5.0 μs | 3.1 KB |
+| Promise — ResolvePromise on a pending promise | 15.9 μs | 8.4 KB |
+| Async host fn — 100 calls, already-completed tasks | 1.10 ms | 372 KB |
+
+`AsyncBridgeBenchmarks` scales the number of host tasks in flight (`N`):
+
+| Benchmark | N = 1 | N = 100 | N = 1 000 |
+|---|---|---|---|
+| N concurrent host calls, drained with `ExecutePendingJobsAsync` | 47 μs | 1.07 ms | 9.97 ms |
+| 1 000 guest jobs while N host tasks are in flight | 2.08 ms | 2.12 ms | 1.98 ms |
+
+Concurrent host calls cost ~10 μs / ~3.8 KB each, linearly. Pending host tasks no longer slow down
+unrelated guest jobs: before 1.4.0 the bridge rescanned every in-flight task after each job
+(3.98 ms at N = 1 000).
 
 ---
 

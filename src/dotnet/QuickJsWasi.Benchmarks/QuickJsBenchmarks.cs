@@ -14,7 +14,7 @@ namespace QuickJsWasi.Benchmarks;
 ///   - Value marshalling (Dump / HostToHandle)
 ///   - Snapshot capture and restore
 ///   - ExportHandle / ImportHandle
-///   - Promise creation and resolution
+///   - Promise creation and resolution, async host functions (see also AsyncBridgeBenchmarks)
 ///   - GC
 ///
 /// Run with:
@@ -360,9 +360,64 @@ public class QuickJsBenchmarks
             f.Value.Dispose();
     }
 
+    [Benchmark(Description = "Promise — guest-only await chain ×1 000")]
+    [ArgumentsSource(nameof(HotVmSource))]
+    public int Promise_GuestAwaitChain(HotVm h)
+    {
+        using var p = h.Vm.Eval("(async () => { for (let i = 0; i < 1000; i++) await null; })()");
+        return h.Vm.ExecutePendingJobs();
+    }
+
+    [Benchmark(Description = "Promise — Deferred create + resolve from .NET")]
+    [ArgumentsSource(nameof(HotVmSource))]
+    public void Promise_DeferredResolve(HotVm h)
+    {
+        var d = h.Vm.NewPromise();
+        d.Resolve(h.Vm.UndefinedValue);
+        d.Handle.Dispose();
+    }
+
+    [Benchmark(Description = "Promise — ResolvePromise on a pending promise")]
+    [ArgumentsSource(nameof(HotVmSource))]
+    public async Task Promise_ResolvePending(HotVm h)
+    {
+        var d = h.Vm.NewPromise();
+        var task = h.Vm.ResolvePromise(d.Handle);
+        d.Resolve(h.Vm.TrueValue);
+        h.Vm.ExecutePendingJobs();
+        var result = await task;
+        if (result is JSPromiseResult.Fulfilled f)
+            f.Value.Dispose();
+        d.Handle.Dispose();
+    }
+
+    public class AsyncHostState : IDisposable
+    {
+        private static readonly Task<object?> Completed = Task.FromResult<object?>(1d);
+        public QuickJs Vm { get; }
+        public AsyncHostState(byte[]? wasm)
+        {
+            Vm = QuickJs.CreateAsync(new QuickJsOptions { WasmBytes = wasm }).GetAwaiter().GetResult();
+            using var fn = Vm.NewHostFunction("ready", (AsyncHostFunction)((_, _) => Completed));
+            Vm.Global.SetProp("ready", fn);
+            using var _ = Vm.Eval("1+1"); // warm
+        }
+        public void Dispose() => Vm.Dispose();
+    }
+
+    public IEnumerable<AsyncHostState> AsyncHostSource() { yield return new AsyncHostState(_wasm); }
+
+    [Benchmark(Description = "Async host fn — 100 calls, already-completed tasks")]
+    [ArgumentsSource(nameof(AsyncHostSource))]
+    public int AsyncHost_100CompletedCalls(AsyncHostState s)
+    {
+        using var p = s.Vm.Eval("(async () => { let t = 0; for (let i = 0; i < 100; i++) t += await ready(); return t; })()");
+        return s.Vm.ExecutePendingJobs();
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────
 
-    private static byte[]? LoadWasmBytes()
+    internal static byte[]? LoadWasmBytes()
     {
         var assembly = typeof(QuickJs).Assembly;
         var resource = assembly.GetManifestResourceNames()
