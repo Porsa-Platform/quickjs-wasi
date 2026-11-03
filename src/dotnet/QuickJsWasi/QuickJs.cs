@@ -28,6 +28,14 @@ public sealed class QuickJs : IDisposable
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<int, PendingTaskBridge> _pendingTaskBridges = new();
+
+    /// <summary>IDs of bridged tasks that have completed but not yet been delivered to the guest.</summary>
+    private readonly ConcurrentQueue<int> _completedTaskBridges = new();
+
+    /// <summary>Signalled when a bridged task completes; replaced by each waiter of <see cref="ExecutePendingJobsAsync"/>.</summary>
+    private TaskCompletionSource _taskBridgeCompleted = NewTaskBridgeSignal();
+
+    private static readonly ConcurrentDictionary<Type, System.Reflection.PropertyInfo?> TaskResultProperties = new();
     private readonly WasiShim _wasi;
     private bool _disposed;
     private int _nextInternalId;
@@ -38,9 +46,6 @@ public sealed class QuickJs : IDisposable
     /// Non-singleton handles register themselves here on construction.
     /// </summary>
     internal HashSet<JSValueHandle>? _activeScope;
-
-    /// <summary><c>Promise.prototype.then</c>, captured on first use.</summary>
-    private JSValueHandle? _promiseThen;
 
     private QuickJs(Engine engine, Wasmtime.Module module, Store store, Linker linker, WasiShim wasi)
     {
@@ -58,6 +63,16 @@ public sealed class QuickJs : IDisposable
 
     internal NativeExports Exports { get; private set; } = null!;
 
+    /// <summary><see cref="Exports"/>, after checking the VM has not been disposed.</summary>
+    private NativeExports LiveExports
+    {
+        get
+        {
+            ThrowIfDisposed();
+            return Exports;
+        }
+    }
+
     private Instance? Instance { get; set; }
 
     public bool IsDisposed => _disposed;
@@ -69,23 +84,54 @@ public sealed class QuickJs : IDisposable
     public JSValueHandle FalseValue { get; private set; } = null!;
 
     /// <summary>
-    /// Version information for the runtime. Always includes <c>"quickjs"</c> (the QuickJS engine version).
+    /// Version information for the runtime. Always includes <c>"quickjs-wasi"</c> (the
+    /// QuickJsWasi package version) and <c>"quickjs"</c> (the QuickJS engine version).
+    /// The dictionary is computed once and cached.
     /// </summary>
     public IReadOnlyDictionary<string, string> Versions
     {
         get
         {
-            var qjsVersion = ReadCString(Exports.GetQuickJsVersion());
-            return new Dictionary<string, string>(StringComparer.Ordinal)
+            ThrowIfDisposed();
+            return _versions ??= new Dictionary<string, string>(StringComparer.Ordinal)
             {
-                ["quickjs"] = qjsVersion,
+                ["quickjs-wasi"] = PackageVersion,
+                ["quickjs"] = ReadCString(Exports.GetQuickJsVersion()),
             };
+        }
+    }
+
+    private IReadOnlyDictionary<string, string>? _versions;
+
+    private static readonly string PackageVersion =
+        typeof(QuickJs).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion.Split('+')[0]
+        ?? typeof(QuickJs).Assembly.GetName().Version?.ToString(3)
+        ?? "0.0.0";
+
+    /// <summary>
+    /// Upper bound for <see cref="QuickJsOptions.MaxStackSize"/>, in bytes. The guest's
+    /// native WebAssembly stack is 1 MiB; keeping the JS stack limit at half of that leaves
+    /// room for frames QuickJS does not account for, so overflow is reported as a catchable
+    /// guest <c>RangeError</c> rather than trapping the instance.
+    /// </summary>
+    public const long MAX_STACK_SIZE = 512 * 1024;
+
+    private static void ValidateOptions(QuickJsOptions options)
+    {
+        if (options.MaxStackSize is long stackSize && (stackSize < 0 || stackSize > MAX_STACK_SIZE))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(QuickJsOptions.MaxStackSize), stackSize, $"MaxStackSize must be an integer between 0 and {MAX_STACK_SIZE}.");
         }
     }
 
     public static Task<QuickJs> CreateAsync(QuickJsOptions? options = null)
     {
         options ??= new QuickJsOptions();
+        ValidateOptions(options);
         var wasm = options.WasmBytes ?? LoadDefaultWasm() ?? throw new InvalidOperationException("quickjs.wasm not found. Set QuickJsOptions.WasmBytes or place quickjs.wasm in Resources/.");
         var engine = new Engine();
         var module = Module.FromBytes(engine, "quickjs", wasm);
@@ -112,6 +158,7 @@ public sealed class QuickJs : IDisposable
     {
         ArgumentNullException.ThrowIfNull(snapshot);
         options ??= new QuickJsOptions();
+        ValidateOptions(options);
         if (snapshot.Extensions is { Count: > 0 })
         {
             throw new NotSupportedException("Snapshot restore with extensions is not yet supported by the .NET host.");
@@ -302,6 +349,7 @@ public sealed class QuickJs : IDisposable
     /// </summary>
     public void RegisterHostCallback(string name, HostFunction callback)
     {
+        ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(callback);
         _hostCallbacks[name] = callback;
@@ -332,6 +380,7 @@ public sealed class QuickJs : IDisposable
     /// <exception cref="InvalidOperationException">Thrown when the handle is borrowed or disposed.</exception>
     public int ExportHandle(JSValueHandle handle)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(handle);
         if (handle.Vm != this)
             throw new InvalidOperationException("Cannot export a handle that belongs to a different VM.");
@@ -350,6 +399,7 @@ public sealed class QuickJs : IDisposable
     /// <exception cref="ArgumentOutOfRangeException">Thrown when the token is out of valid range.</exception>
     public JSValueHandle ImportHandle(int token)
     {
+        ThrowIfDisposed();
         var memSize = Exports.Memory.GetSpan<byte>(0).Length;
         if (token <= 0 || token >= memSize)
             throw new ArgumentOutOfRangeException(nameof(token), "Token is not a valid handle pointer.");
@@ -406,6 +456,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle Eval(string code, string filename = "<eval>", int flags = 0)
     {
+        ThrowIfDisposed();
         var codePtr = WriteString(code);
         var filePtr = WriteString(filename);
         try
@@ -421,6 +472,7 @@ public sealed class QuickJs : IDisposable
 
     public byte[] Compile(string code, string filename = "<compile>", int evalFlags = 0, int writeFlags = 0)
     {
+        ThrowIfDisposed();
         var codePtr = WriteString(code);
         var filePtr = WriteString(filename);
         var outLenPtr = Exports.WasmMalloc(4);
@@ -452,6 +504,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle EvalBytecode(byte[] bytecode)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(bytecode);
         var ptr = Exports.WasmMalloc(bytecode.Length);
         try
@@ -467,13 +520,17 @@ public sealed class QuickJs : IDisposable
 
     public int ExecutePendingJobs()
     {
-        var count = 0;
+        ThrowIfDisposed();
+        // Full scans (start, and once the job queue is empty) deliver every task already
+        // complete at call time even if its completion callback has not run yet; between
+        // jobs only the completion queue is drained, so cost is O(in flight + jobs).
+        var count = DrainCompletedTaskBridges(scanAll: true);
         while (true)
         {
-            count += DrainCompletedTaskBridges();
+            count += DrainCompletedTaskBridges(scanAll: false);
             if (Exports.IsJobPending() == 0)
             {
-                var moreCompleted = DrainCompletedTaskBridges();
+                var moreCompleted = DrainCompletedTaskBridges(scanAll: true);
                 count += moreCompleted;
                 if (moreCompleted == 0)
                 {
@@ -495,9 +552,53 @@ public sealed class QuickJs : IDisposable
         return count;
     }
 
-    public JSValueHandle GetException() => new(this, Exports.GetException());
+    /// <summary>
+    /// Run the microtask queue until it is empty <i>and</i> every task returned by an async
+    /// host callback (or passed to <see cref="HostToHandle(Task)"/>) has completed and been
+    /// delivered to the guest. Returns the total number of jobs run.
+    ///
+    /// <para>
+    /// <see cref="ExecutePendingJobs"/> only delivers host tasks that have already completed
+    /// when it is called. A task that completes a moment later — e.g. an <c>async</c> lambda
+    /// whose continuation is still queued on the thread pool — is missed, and nothing resumes
+    /// the guest. This method awaits those tasks instead, so guest <c>await</c> chains that
+    /// depend on host I/O run to completion.
+    /// </para>
+    ///
+    /// <para>
+    /// If a host task never completes, this never returns; pass a
+    /// <paramref name="cancellationToken"/> to bound the wait. The VM is not thread-safe:
+    /// do not use it from other threads while this call is awaiting.
+    /// </para>
+    /// </summary>
+    /// <exception cref="JSException">A job threw an uncaught guest exception.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<int> ExecutePendingJobsAsync(CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
 
-    public JSValueHandle GetPromiseResult(JSValueHandle promise) => new(this, Exports.PromiseResult(promise.Ptr));
+        var count = ExecutePendingJobs();
+        while (!_pendingTaskBridges.IsEmpty)
+        {
+            var signal = Volatile.Read(ref _taskBridgeCompleted);
+            if (_completedTaskBridges.IsEmpty)
+            {
+                // A completion racing this check enqueues first and then signals the
+                // current TaskCompletionSource, which is `signal`, so it cannot be missed.
+                await signal.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            Interlocked.CompareExchange(ref _taskBridgeCompleted, NewTaskBridgeSignal(), signal);
+            if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
+            count += ExecutePendingJobs();
+        }
+
+        return count;
+    }
+
+    public JSValueHandle GetException() => new(this, LiveExports.GetException());
+
+    public JSValueHandle GetPromiseResult(JSValueHandle promise) => new(this, LiveExports.PromiseResult(promise.Ptr));
 
     /// <summary>
     /// Resolve a promise handle. Returns a host-side <see cref="Task{T}"/> that resolves
@@ -519,6 +620,7 @@ public sealed class QuickJs : IDisposable
     /// </summary>
     public Task<JSPromiseResult> ResolvePromise(JSValueHandle promise)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(promise);
 
         if (!promise.IsPromise)
@@ -539,75 +641,88 @@ public sealed class QuickJs : IDisposable
 
         // Pending — attach internal .then/.catch callbacks to get notified
         var tcs = new TaskCompletionSource<JSPromiseResult>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var id = Guid.NewGuid().ToString("N");
+        var id = _nextInternalId++;
         var fulfilledName = $"__onFulfilled:{id}";
         var rejectedName = $"__onRejected:{id}";
 
-        HostFunction onFulfilled = (_, args) =>
+        using var onFulfilled = NewInternalFunction(fulfilledName, (_, args) =>
         {
             var val = args.Count > 0 ? args[0].Dup() : UndefinedValue;
             _hostCallbacks.Remove(fulfilledName);
             _hostCallbacks.Remove(rejectedName);
             tcs.TrySetResult(new JSPromiseResult.Fulfilled(val));
             return UndefinedValue;
-        };
-        HostFunction onRejected = (_, args) =>
+        });
+        using var onRejected = NewInternalFunction(rejectedName, (_, args) =>
         {
             var val = args.Count > 0 ? args[0].Dup() : UndefinedValue;
             _hostCallbacks.Remove(fulfilledName);
             _hostCallbacks.Remove(rejectedName);
             tcs.TrySetResult(new JSPromiseResult.Rejected(val));
             return UndefinedValue;
-        };
+        });
 
-        _hostCallbacks[fulfilledName] = onFulfilled;
-        _hostCallbacks[rejectedName] = onRejected;
-
-        var fulfilledWritten = WriteString(fulfilledName);
-        var onFulfilledHandle = new JSValueHandle(this, Exports.NewHostFunction(fulfilledWritten.Ptr, fulfilledWritten.Length, 1));
-        Exports.WasmFree(fulfilledWritten.Ptr);
-
-        var rejectedWritten = WriteString(rejectedName);
-        var onRejectedHandle = new JSValueHandle(this, Exports.NewHostFunction(rejectedWritten.Ptr, rejectedWritten.Length, 1));
-        Exports.WasmFree(rejectedWritten.Ptr);
-
-        // Use the captured intrinsic rather than reading `.then` off the value:
-        // a proxy or a patched own property would otherwise run guest code here.
-        CallFunctionRaw(GetPromiseThen(), promise, onFulfilledHandle, onRejectedHandle).Dispose();
-        onFulfilledHandle.Dispose();
-        onRejectedHandle.Dispose();
+        // Subscribe via the engine-level primitive: JS_PromiseThen does not consult
+        // Promise.prototype.then or Symbol.species, so guest code that patches either
+        // cannot intercept the subscription (or run at all during it).
+        PromiseThenRaw(promise, onFulfilled, onRejected).Dispose();
 
         return tcs.Task;
     }
 
     /// <summary>
-    /// <c>Promise.prototype.then</c>, captured once and reused.
-    ///
-    /// <see cref="ResolvePromise"/> needs to subscribe to a promise without executing
-    /// guest code, so it must not read <c>.then</c> off the value being resolved.
+    /// Subscribe to a promise without executing guest code, via quickjs-ng's
+    /// <c>JS_PromiseThen</c> (no <c>Promise.prototype.then</c> lookup, no
+    /// <c>Symbol.species</c>). Returns the chained promise; the handler handles are
+    /// borrowed, so the caller still owns and disposes them.
     /// </summary>
-    internal JSValueHandle GetPromiseThen()
-    {
-        if (_promiseThen is null)
-        {
-            // Capture outside any active scope, since this outlives it.
-            var enclosing = _activeScope;
-            _activeScope = null;
-            try
-            {
-                _promiseThen = Eval("Promise.prototype.then");
-            }
-            finally
-            {
-                _activeScope = enclosing;
-            }
-        }
+    internal JSValueHandle PromiseThenRaw(JSValueHandle promise, JSValueHandle onFulfilled, JSValueHandle onRejected)
+        => new(this, Exports.PromiseThen(promise.Ptr, onFulfilled.Ptr, onRejected.Ptr));
 
-        return _promiseThen;
+    /// <summary>
+    /// Create a host function registered under an internal name. Unlike
+    /// <see cref="NewEphemeralFunction(HostFunction)"/>, disposing the handle does not
+    /// unregister the callback: the callback removes its own registration when it runs.
+    /// </summary>
+    internal int NextInternalId() => _nextInternalId++;
+
+    internal void UnregisterInternalCallback(string name) => _hostCallbacks.Remove(name);
+
+    internal JSValueHandle NewInternalFunction(string name, HostFunction fn)
+    {
+        _hostCallbacks[name] = fn;
+        var written = WriteString(name);
+        try
+        {
+            return new JSValueHandle(this, Exports.NewHostFunction(written.Ptr, written.Length, 0));
+        }
+        finally
+        {
+            Exports.WasmFree(written.Ptr);
+        }
+    }
+
+    /// <summary>
+    /// Mark a promise as handled: an eventual (or already-recorded) rejection will not
+    /// be reported to <see cref="QuickJsOptions.OnUnhandledRejection"/>. Useful when the
+    /// host observes a rejection through other means (e.g. <see cref="ResolvePromise"/>).
+    /// No-op if the handle is not a promise.
+    /// </summary>
+    public void MarkPromiseHandled(JSValueHandle promise)
+    {
+        ThrowIfDisposed();
+        ArgumentNullException.ThrowIfNull(promise);
+        Exports.PromiseMarkAsHandled(promise.Ptr);
+    }
+
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new ObjectDisposedException(nameof(QuickJs));
     }
 
     public JSValueHandle NewString(string value)
     {
+        ThrowIfDisposed();
         var written = WriteString(value);
         try
         {
@@ -619,13 +734,14 @@ public sealed class QuickJs : IDisposable
         }
     }
 
-    public JSValueHandle NewNumber(double value) => new(this, Exports.NewNumber(value));
-    public JSValueHandle NewObject() => new(this, Exports.NewObject());
-    public JSValueHandle NewArray() => new(this, Exports.NewArray());
-    public JSValueHandle NewBigInt64(long value) => new(this, Exports.NewBigInt64(unchecked((int)value), unchecked((int)(value >> 32))));
+    public JSValueHandle NewNumber(double value) => new(this, LiveExports.NewNumber(value));
+    public JSValueHandle NewObject() => new(this, LiveExports.NewObject());
+    public JSValueHandle NewArray() => new(this, LiveExports.NewArray());
+    public JSValueHandle NewBigInt64(long value) => new(this, LiveExports.NewBigInt64(unchecked((int)value), unchecked((int)(value >> 32))));
 
     public JSValueHandle NewSymbol(string description, bool isGlobal)
     {
+        ThrowIfDisposed();
         var written = WriteString(description);
         try
         {
@@ -639,6 +755,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle NewArrayBuffer(ReadOnlySpan<byte> data)
     {
+        ThrowIfDisposed();
         var ptr = Exports.WasmMalloc(data.Length);
         try
         {
@@ -653,6 +770,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle NewUInt8Array(ReadOnlySpan<byte> data)
     {
+        ThrowIfDisposed();
         var ptr = Exports.WasmMalloc(data.Length);
         try
         {
@@ -667,6 +785,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle NewHostFunction(string name, HostFunction callback, int argCount = 0)
     {
+        ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(callback);
         if (_hostCallbacks.ContainsKey(name))
@@ -704,6 +823,7 @@ public sealed class QuickJs : IDisposable
 
     public Deferred NewPromise()
     {
+        ThrowIfDisposed();
         var resolveOutPtr = Exports.WasmMalloc(4);
         var rejectOutPtr = Exports.WasmMalloc(4);
         try
@@ -722,6 +842,7 @@ public sealed class QuickJs : IDisposable
 
     public JSValueHandle NewError(Exception error)
     {
+        ThrowIfDisposed();
         ArgumentNullException.ThrowIfNull(error);
         var handle = new JSValueHandle(this, Exports.NewError());
         using var message = NewString(error.Message);
@@ -894,11 +1015,16 @@ public sealed class QuickJs : IDisposable
     /// </summary>
     public bool UnregisterHostCallback(string name)
     {
+        ThrowIfDisposed();
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         return _hostCallbacks.Remove(name);
     }
 
-    public object? Dump(JSValueHandle handle) => ValueMarshalling.Dump(this, handle);
+    public object? Dump(JSValueHandle handle)
+    {
+        ThrowIfDisposed();
+        return ValueMarshalling.Dump(this, handle);
+    }
 
     public JSValueHandle HostToHandle(Task task)
     {
@@ -912,17 +1038,21 @@ public sealed class QuickJs : IDisposable
         return HostTaskToHandle(task);
     }
 
-    public JSValueHandle HostToHandle(object? value) => ValueMarshalling.HostToHandle(this, value);
+    public JSValueHandle HostToHandle(object? value)
+    {
+        ThrowIfDisposed();
+        return ValueMarshalling.HostToHandle(this, value);
+    }
 
     public Snapshot Snapshot()
-        => new(Exports.Memory.GetSpan<byte>(0).ToArray(), Exports.StackPointerValue, Exports.GetRuntimePtr(), Exports.GetContextPtr(), Array.Empty<SnapshotExtension>());
+        => new(LiveExports.Memory.GetSpan<byte>(0).ToArray(), Exports.StackPointerValue, Exports.GetRuntimePtr(), Exports.GetContextPtr(), Array.Empty<SnapshotExtension>());
 
-    public void RunGc() => Exports.RunGc();
+    public void RunGc() => LiveExports.RunGc();
 
     public int GcThreshold
     {
-        get => Exports.GetGcThreshold();
-        set => Exports.SetGcThreshold(value);
+        get => LiveExports.GetGcThreshold();
+        set => LiveExports.SetGcThreshold(value);
     }
 
     /// <summary>
@@ -931,6 +1061,7 @@ public sealed class QuickJs : IDisposable
     /// </summary>
     public MemoryUsage GetMemoryUsage()
     {
+        ThrowIfDisposed();
         // Allocate a buffer for 26 int64 fields (26 * 8 = 208 bytes)
         const int fieldCount = 26;
         var bufPtr = Exports.WasmMalloc(fieldCount * 8);
@@ -977,6 +1108,7 @@ public sealed class QuickJs : IDisposable
 
     public string TypeOf(JSValueHandle handle)
     {
+        ThrowIfDisposed();
         if (handle.IsUndefined) return "undefined";
         if (handle.IsNull) return "object";
         if (handle.IsBool) return "boolean";
@@ -998,7 +1130,6 @@ public sealed class QuickJs : IDisposable
 
         _disposed = true;
         _activeScope = null;
-        _promiseThen = null;
 
         // NB: Do NOT call Exports.Destroy() here. The C-side qjs_destroy calls
         // JS_FreeContext which leaves the runtime with a non-empty gc_obj_list.
@@ -1020,24 +1151,49 @@ public sealed class QuickJs : IDisposable
         _engine.Dispose();
     }
 
-    private int DrainCompletedTaskBridges()
+    private int DrainCompletedTaskBridges(bool scanAll)
     {
+        // The queue only holds completed bridges, so draining it costs O(completed).
+        // A task can report IsCompleted before its completion callback has enqueued it
+        // (e.g. a TaskCompletionSource with RunContinuationsAsynchronously), so callers
+        // that must see every completed task pass scanAll, which costs O(in flight).
         var count = 0;
-        foreach (var entry in _pendingTaskBridges)
+        while (_completedTaskBridges.TryDequeue(out var bridgeId))
         {
-            if (!entry.Value.Task.IsCompleted)
-            {
-                continue;
-            }
+            count += TryCompleteTaskBridge(bridgeId);
+        }
 
-            if (_pendingTaskBridges.TryRemove(entry.Key, out var pending))
+        if (scanAll)
+        {
+            foreach (var entry in _pendingTaskBridges)
             {
-                CompleteDeferredFromTask(pending.Task, pending.Deferred);
-                count++;
+                if (entry.Value.Task.IsCompleted)
+                {
+                    count += TryCompleteTaskBridge(entry.Key);
+                }
             }
         }
 
         return count;
+    }
+
+    private int TryCompleteTaskBridge(int bridgeId)
+    {
+        if (!_pendingTaskBridges.TryRemove(bridgeId, out var pending))
+        {
+            return 0;
+        }
+
+        CompleteDeferredFromTask(pending.Task, pending.Deferred);
+        return 1;
+    }
+
+    private static TaskCompletionSource NewTaskBridgeSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void OnTaskBridgeCompleted(int bridgeId)
+    {
+        _completedTaskBridges.Enqueue(bridgeId);
+        Volatile.Read(ref _taskBridgeCompleted).TrySetResult();
     }
 
     private HostFunction WrapAsyncHostAction(AsyncHostAction callback)
@@ -1085,6 +1241,16 @@ public sealed class QuickJs : IDisposable
 
         var bridgeId = Interlocked.Increment(ref _nextPendingTaskBridgeId);
         _pendingTaskBridges[bridgeId] = new PendingTaskBridge(task, deferred);
+        task.ContinueWith(
+            static (_, state) =>
+            {
+                var (vm, id) = ((QuickJs, int))state!;
+                vm.OnTaskBridgeCompleted(id);
+            },
+            (this, bridgeId),
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
         return deferred.Handle;
     }
@@ -1130,8 +1296,19 @@ public sealed class QuickJs : IDisposable
 
     private static bool TryGetTaskResult(Task task, out object? result)
     {
-        var property = task.GetType().GetProperty("Result");
-        if (property is null || property.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult")
+        // Fast path: AsyncHostFunction callbacks return Task<object?>.
+        if (task is Task<object?> objectTask)
+        {
+            result = objectTask.Result;
+            return true;
+        }
+
+        var property = TaskResultProperties.GetOrAdd(task.GetType(), static type =>
+        {
+            var p = type.GetProperty("Result");
+            return p is null || p.PropertyType.FullName == "System.Threading.Tasks.VoidTaskResult" ? null : p;
+        });
+        if (property is null)
         {
             result = null;
             return false;

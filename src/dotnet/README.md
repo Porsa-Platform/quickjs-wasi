@@ -127,7 +127,7 @@ using var vm = await QuickJs.CreateAsync();
 using var vm = await QuickJs.CreateAsync(new QuickJsOptions
 {
     MemoryLimit   = 32 * 1024 * 1024,  // 32 MB JS heap
-    MaxStackSize  = 4 * 1024 * 1024,   // 4 MB call stack
+    MaxStackSize  = 256 * 1024,        // 256 KB JS stack (max QuickJs.MAX_STACK_SIZE)
     TimezoneOffset = TimezoneOffsetOption.Host,
 });
 ```
@@ -344,7 +344,16 @@ handle.IsWeakSet     // engine-level WeakSet brand check
 handle.IsDataView    // engine-level DataView brand check
 handle.IsException   // value is an internal JS exception sentinel
 handle.ClassId       // raw QuickJS class ID (advanced use)
+handle.ClassName     // engine class name, e.g. "Map" (trap-free, cannot be spoofed); null for primitives
+handle.ConstructorName // constructor.name (reads properties: may run getters / proxy traps)
+handle.TypeOf        // same as vm.TypeOf(handle)
 handle.PromiseState  // 0 = pending, 1 = fulfilled, 2 = rejected
+```
+
+`Consume` uses a handle and disposes it in one step:
+
+```csharp
+double n = vm.Eval("6 * 7").Consume(h => h.ToNumber()); // 42, handle disposed
 ```
 
 Example — safe value extraction:
@@ -524,8 +533,18 @@ vm.Global.SetProp("loadFile", loadFn);
 ```
 
 > **Important:** QuickJS's microtask queue still does not run automatically.
-> After an async host callback's task completes, call `ExecutePendingJobs()` to
-> continue any guest-side `await` / `.then()` chains that depend on it.
+> Use `await vm.ExecutePendingJobsAsync()` to drive guest-side `await` / `.then()`
+> chains that depend on async host callbacks: it runs the queue, awaits any host
+> tasks still in flight, delivers their results, and repeats until nothing is left.
+> `ExecutePendingJobs()` only delivers tasks that have *already* completed when it
+> is called, so a task finishing a moment later (e.g. an `async` lambda whose
+> continuation is still queued on the thread pool) would be missed.
+
+```csharp
+using var promise = vm.Eval("loadFile('data.bin').then(r => r.size)");
+using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+await vm.ExecutePendingJobsAsync(cts.Token); // bound the wait in case a host task never completes
+```
 
 ### 8.1 Ephemeral functions
 
@@ -664,6 +683,10 @@ vm.Eval("Promise.resolve(42).then(v => console.log(v))");
 int jobsRun = vm.ExecutePendingJobs(); // prints "42", returns 1
 ```
 
+When async host callbacks are involved, use `await vm.ExecutePendingJobsAsync(cancellationToken)`
+instead (see [section 8](#8-host-functions)): it also waits for in-flight host tasks and keeps
+pumping until both the queue and the host tasks are drained.
+
 ---
 
 ## 11. Error handling
@@ -797,7 +820,8 @@ using var vm = await QuickJs.CreateAsync(new QuickJsOptions
 });
 ```
 
-Set to `0` to disable the QuickJS stack guard entirely.
+Set to `0` to disable the QuickJS stack guard entirely. Values outside `0`…`QuickJs.MAX_STACK_SIZE`
+throw `ArgumentOutOfRangeException` from `CreateAsync` / `RestoreAsync`.
 
 ### 13.3 Garbage collection
 
@@ -909,7 +933,8 @@ Available flags:
 Control the timezone offset used by `Date` inside the sandbox:
 
 ```csharp
-// Mirror the host machine's local timezone (default)
+// Mirror the host machine's local timezone, DST included (default).
+// Before 1.4.0 this was always UTC regardless of the host timezone.
 TimezoneOffset = TimezoneOffsetOption.Host
 
 // Fixed UTC offset (minutes west of UTC, same sign convention as Date.getTimezoneOffset())
@@ -1005,8 +1030,9 @@ vm2.Eval("log('hello from restored VM')"); // prints "Restored: hello from resto
 ## 17. Version information
 
 ```csharp
-IReadOnlyDictionary<string, string> versions = vm.Versions;
-Console.WriteLine(versions["quickjs"]); // e.g. "0.8.0"
+IReadOnlyDictionary<string, string> versions = vm.Versions; // cached
+Console.WriteLine(versions["quickjs-wasi"]); // QuickJsWasi package version, e.g. "1.4.0"
+Console.WriteLine(versions["quickjs"]);      // QuickJS-NG engine version, e.g. "0.17.0"
 ```
 
 ---
@@ -1063,7 +1089,9 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `Compile(code, filename?, evalFlags?, compileFlags?)` | Compile to `byte[]` bytecode                               |
 | `EvalBytecode(bytecode)`                              | Execute compiled bytecode                                  |
 | `ExecutePendingJobs()`                                | Run the microtask queue; returns job count                 |
-| `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>`         |
+| `ExecutePendingJobsAsync(cancellationToken?)`         | Run jobs and await in-flight async host tasks until drained |
+| `ResolvePromise(promise)`                             | Await a QuickJS promise as `Task<JSPromiseResult>` (trap-free subscription) |
+| `MarkPromiseHandled(promise)`                         | Suppress `OnUnhandledRejection` for a promise              |
 | `CallFunction(func, thisVal, args...)`                | Call a JS function; throws on exception                    |
 | `NewString(value)`                                    | Create a JS string                                         |
 | `NewNumber(value)`                                    | Create a JS number                                         |
@@ -1093,7 +1121,8 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `Global`                                              | The global object (singleton, do not dispose)              |
 | `UndefinedValue / NullValue / TrueValue / FalseValue` | Cached singletons (do not dispose)                         |
 | `GcThreshold`                                         | Get/set the auto-GC threshold in bytes                     |
-| `Versions`                                            | `{ "quickjs": "x.y.z" }`                                   |
+| `Versions`                                            | `{ "quickjs-wasi": …, "quickjs": … }` (cached)             |
+| `MAX_STACK_SIZE`                                      | Upper bound for `QuickJsOptions.MaxStackSize` (512 KiB)    |
 | `IsDisposed`                                          | Whether the VM has been disposed                           |
 | `Dispose()`                                           | Release all WASM resources                                 |
 
@@ -1106,16 +1135,18 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `SetProp(name, value)`                                    | Set property by string name                          |
 | `SetProp(key, value)`                                     | Set property by symbol key                           |
 | `DefineProp(name, value, …)`                              | Define property with explicit descriptor flags       |
-| `Keys()`                                                  | Enumerable own string property names                 |
+| `DefineProp(key, value, …)`                               | Same, with a string or symbol key handle             |
+| `Keys()`                                                  | Enumerable own string property names (`[]` if enumeration throws) |
 | `GetOwnPropertyNames()`                                   | All own string property names (incl. non-enumerable) |
 | `GetOwnPropertyKeys()`                                    | All own keys including symbols (`Reflect.ownKeys()`) |
 | `GetOwnPropertyDescriptor(key)`                           | Property descriptor without invoking getters         |
 | `HasOwnProperty(name)`                                    | `Object.prototype.hasOwnProperty`                    |
 | `PropertyIsEnumerable(name)`                              | `Object.prototype.propertyIsEnumerable`              |
 | `GetPrototypeOf()`                                        | Get the prototype                                    |
-| `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free)                    |
-| `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free)                   |
+| `GetProxyTarget()`                                        | Get `[[ProxyTarget]]` (trap-free; `JSException` if not a proxy) |
+| `GetProxyHandler()`                                       | Get `[[ProxyHandler]]` (trap-free; `JSException` if not a proxy) |
 | `Dup()`                                                   | Duplicate (increment refcount)                       |
+| `Consume(fn)`                                             | Run `fn(handle)`, then dispose the handle            |
 | `Length`                                                  | UTF-16 code unit count (strings) or element count (arrays) |
 | `Identity`                                                | Numeric pointer identity — same for two handles of the same object |
 | `ToNumber()`                                              | Extract as `double`                                  |
@@ -1125,6 +1156,9 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 | `IsUndefined / IsNull / IsBool / IsNumber / IsString / …` | Type checks                                          |
 | `PromiseState`                                            | 0 = pending, 1 = fulfilled, 2 = rejected             |
 | `ClassId`                                                 | Raw QuickJS class ID                                 |
+| `ClassName`                                               | Engine class name (trap-free), or `null`             |
+| `ConstructorName`                                         | `constructor.name`, or `null` (may run guest code)   |
+| `TypeOf`                                                  | The `typeof` string                                  |
 | `Dispose()`                                               | Free the JS value                                    |
 
 ### `QuickJsOptions`
@@ -1334,7 +1368,7 @@ cd src/dotnet
 dotnet run --configuration Release --project QuickJsWasi.Benchmarks
 ```
 
-The suite covers every major use case: VM creation, eval, bytecode compilation, host function dispatch, string transport, property operations, value marshalling, snapshot capture/restore, portable handles, and promise resolution.
+The suite covers every major use case: VM creation, eval, bytecode compilation, host function dispatch, string transport, property operations, value marshalling, snapshot capture/restore, portable handles, promises, and the async host bridge. Pass BenchmarkDotNet arguments after `--` to narrow it, e.g. `-- --filter "*AsyncBridge*"`.
 
 ### Results
 
@@ -1371,6 +1405,29 @@ Measured on Ubuntu 22.04 x64 · .NET 10.0 · Intel Xeon Platinum 8370C @ 2.80 GH
 | Promise — resolve + await | 31 μs | 2.4 KB |
 
 > **Note:** Cold-start cost is dominated by Wasmtime WASM module instantiation and is paid once per `QuickJs.CreateAsync()` call. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
+
+### Promises and the async host bridge
+
+Measured on Windows 11 · .NET 10.0 · Intel Core i7-11370H · `BenchmarkDotNet v0.15.8` (`--job short`).
+Run only these with `--filter "*Promise_*" "*AsyncHost_*" "*AsyncBridge*"`.
+
+| Benchmark | Mean | Alloc |
+|---|---|---|
+| Promise — guest-only await chain ×1 000 | 1.91 ms | 49 KB |
+| Promise — Deferred create + resolve from .NET | 5.0 μs | 3.1 KB |
+| Promise — ResolvePromise on a pending promise | 15.9 μs | 8.4 KB |
+| Async host fn — 100 calls, already-completed tasks | 1.10 ms | 372 KB |
+
+`AsyncBridgeBenchmarks` scales the number of host tasks in flight (`N`):
+
+| Benchmark | N = 1 | N = 100 | N = 1 000 |
+|---|---|---|---|
+| N concurrent host calls, drained with `ExecutePendingJobsAsync` | 47 μs | 1.07 ms | 9.97 ms |
+| 1 000 guest jobs while N host tasks are in flight | 2.08 ms | 2.12 ms | 1.98 ms |
+
+Concurrent host calls cost ~10 μs / ~3.8 KB each, linearly. Pending host tasks no longer slow down
+unrelated guest jobs: before 1.4.0 the bridge rescanned every in-flight task after each job
+(3.98 ms at N = 1 000).
 
 ---
 

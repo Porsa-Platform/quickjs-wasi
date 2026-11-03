@@ -385,8 +385,14 @@ public sealed class EvalTests : TestBase
 
         Assert.False(task.IsCompleted);
         tcs.SetResult("done");
-        vm.ExecutePendingJobs();
 
+        // The async lambda's own task completes on a thread-pool continuation after
+        // SetResult, so a single ExecutePendingJobs() can run before the bridge sees
+        // it complete; ExecutePendingJobsAsync awaits it instead.
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await vm.ExecutePendingJobsAsync(cts.Token);
+
+        Assert.True(task.IsCompleted);
         var settled = await task;
         var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(settled);
         Assert.Equal("done", fulfilled.Value.ToManagedString());
@@ -394,6 +400,88 @@ public sealed class EvalTests : TestBase
 
         using var check = vm.Eval("globalThis.asyncHostResult");
         Assert.Equal("done", check.ToManagedString());
+    }
+
+    [Fact]
+    public async Task ExecutePendingJobsAsync_DrivesSequentialAsyncHostCalls()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        var calls = 0;
+        using var fn = vm.NewHostFunction("step", async (_, args) =>
+        {
+            Interlocked.Increment(ref calls);
+            var n = args[0].ToNumber();
+            await Task.Delay(5);
+            return (object?)(n * 2);
+        }, argCount: 1);
+        vm.Global.SetProp("step", fn);
+
+        // Each call starts only after the previous one is delivered to the guest.
+        using var promise = vm.Eval("""
+            (async function () {
+                let v = 1;
+                for (let i = 0; i < 3; i++) v = await step(v);
+                return v;
+            })()
+        """);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var jobs = await vm.ExecutePendingJobsAsync(cts.Token);
+
+        Assert.True(jobs > 0);
+        Assert.Equal(3, calls);
+        Assert.Equal(1, promise.PromiseState); // fulfilled
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(await vm.ResolvePromise(promise));
+        using (fulfilled.Value) Assert.Equal(8d, fulfilled.Value.ToNumber());
+    }
+
+    [Fact]
+    public async Task ExecutePendingJobsAsync_DeliversRejectedHostTask()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        using var fn = vm.NewHostFunction("fail", async (_, _) =>
+        {
+            await Task.Delay(5);
+            throw new InvalidOperationException("late boom");
+        }, argCount: 0);
+        vm.Global.SetProp("fail", fn);
+
+        using var promise = vm.Eval("fail().catch(e => e.message)");
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await vm.ExecutePendingJobsAsync(cts.Token);
+
+        var fulfilled = Assert.IsType<JSPromiseResult.Fulfilled>(await vm.ResolvePromise(promise));
+        using (fulfilled.Value) Assert.Equal("late boom", fulfilled.Value.ToManagedString());
+    }
+
+    [Fact]
+    public async Task ExecutePendingJobsAsync_HonoursCancellation()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        var never = new TaskCompletionSource<object?>();
+        using var fn = vm.NewHostFunction("hang", (_, _) => never.Task, argCount: 0);
+        vm.Global.SetProp("hang", fn);
+        vm.Eval("hang()").Dispose();
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => vm.ExecutePendingJobsAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task ExecutePendingJobsAsync_WithoutHostTasks_MatchesExecutePendingJobs()
+    {
+        if (!HasWasm) return;
+        using var vm = await CreateVmAsync();
+        vm.Eval("Promise.resolve(42).then(v => globalThis.seen = v)").Dispose();
+
+        var jobs = await vm.ExecutePendingJobsAsync();
+
+        Assert.Equal(1, jobs);
+        using var seen = vm.Eval("globalThis.seen");
+        Assert.Equal(42d, seen.ToNumber());
     }
 
     [Fact]
@@ -780,14 +868,8 @@ public sealed class EvalTests : TestBase
         // DateTimeOffset.Offset.TotalMinutes is minutes EAST of UTC, so negate.
         var expected = -(int)TimeZoneInfo.Local.GetUtcOffset(DateTimeOffset.UnixEpoch).TotalMinutes;
 
-        // Some WASM builds may not include the --wrap=__secs_to_zone linker flag,
-        // in which case the C# callback is never called and the offset is 0.
-        if (actual == 0)
-        {
-            Assert.Equal(0d, actual);
-            return;
-        }
-
+        // No escape for actual == 0: that is exactly what the old (always-UTC) host
+        // implementation returned, and the Makefile always links --wrap=__secs_to_zone.
         Assert.Equal(expected, actual);
     }
 

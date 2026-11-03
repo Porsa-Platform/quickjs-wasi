@@ -29,7 +29,11 @@ internal sealed class NativeExports
     {
         if (!_functions.TryGetValue(name, out var function))
         {
-            function = Instance.GetFunction(name) ?? throw new InvalidOperationException($"Missing export '{name}'.");
+            // A missing export means quickjs.wasm was built from an older c/interface.c
+            // than this host expects; rebuild it rather than masking the failure.
+            function = Instance.GetFunction(name) ?? throw new InvalidOperationException(
+                $"Missing export '{name}'. The loaded quickjs.wasm is older than c/interface.c; " +
+                "rebuild it with `make quickjs.wasm` and copy it to src/dotnet/QuickJsWasi/Resources/.");
             _functions.Add(name, function);
         }
 

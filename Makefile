@@ -373,13 +373,14 @@ setup:
 		Linux-aarch64) PLATFORM="arm64-linux" ;; \
 		Darwin-arm64)  PLATFORM="arm64-macos" ;; \
 		Darwin-x86_64) PLATFORM="x86_64-macos" ;; \
+		MINGW*-x86_64|MSYS*-x86_64|CYGWIN*-x86_64) PLATFORM="x86_64-windows" ;; \
 		*) echo "Unsupported platform: $$(uname -s)-$$(uname -m)"; exit 1 ;; \
 	esac; \
 	URL="https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-$(WASI_SDK_VERSION_REQUIRED)/wasi-sdk-$(WASI_SDK_VERSION_REQUIRED).0-$$PLATFORM.tar.gz"; \
 	echo "Downloading $$URL"; \
 	rm -rf "$(WASI_SDK)"; \
 	mkdir -p "$(WASI_SDK)"; \
-	curl -sL "$$URL" | tar xz -C "$(WASI_SDK)" --strip-components=1; \
+	curl -sfL --retry 3 "$$URL" | tar xz -C "$(WASI_SDK)" --strip-components=1; \
 	echo ""; \
 	echo "wasi-sdk $(WASI_SDK_VERSION_REQUIRED) installed to $(WASI_SDK)"
 
