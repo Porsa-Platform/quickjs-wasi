@@ -22,8 +22,7 @@ public sealed class QuickJs : IDisposable
         public Deferred Deferred { get; } = deferred;
     }
 
-    private readonly Engine _engine;
-    private readonly Wasmtime.Module _module;
+    // The compiled module and its engine are shared by every VM (CompiledModules): a VM owns only its store and linker.
     private readonly Linker _linker;
     private readonly HostCallDispatcher _hostDispatcher;
     private readonly Dictionary<string, HostFunction> _hostCallbacks = new(StringComparer.Ordinal);
@@ -47,10 +46,8 @@ public sealed class QuickJs : IDisposable
     /// </summary>
     internal HashSet<JSValueHandle>? _activeScope;
 
-    private QuickJs(Engine engine, Wasmtime.Module module, Store store, Linker linker, WasiShim wasi)
+    private QuickJs(Store store, Linker linker, WasiShim wasi)
     {
-        _engine = engine;
-        _module = module;
         Store = store;
         _linker = linker;
         _wasi = wasi;
@@ -132,15 +129,7 @@ public sealed class QuickJs : IDisposable
     {
         options ??= new QuickJsOptions();
         ValidateOptions(options);
-        var wasm = options.WasmBytes ?? LoadDefaultWasm() ?? throw new InvalidOperationException("quickjs.wasm not found. Set QuickJsOptions.WasmBytes or place quickjs.wasm in Resources/.");
-        var engine = new Engine();
-        var module = Module.FromBytes(engine, "quickjs", wasm);
-        var store = new Store(engine);
-        var linker = new Linker(engine);
-        var vm = new QuickJs(engine, module, store, linker, new WasiShim());
-        vm.DefineImports(options);
-        vm.Instance = linker.Instantiate(store, module);
-        vm.Exports = new NativeExports(store, vm.Instance);
+        var vm = Instantiate(options);
         vm.Exports.Initialize();
         var initResult = options.Intrinsics.HasValue ? vm.Exports.Init2(options.Intrinsics.Value) : vm.Exports.Init();
         if (initResult != 0)
@@ -183,21 +172,22 @@ public sealed class QuickJs : IDisposable
         return vm;
     }
 
-    private static Task<QuickJs> CreateUninitializedAsync(QuickJsOptions options)
+    private static Task<QuickJs> CreateUninitializedAsync(QuickJsOptions options) => Task.FromResult(Instantiate(options));
+
+    /// <summary>A new instance of the shared compiled module (<see cref="CompiledModules"/>) in a store of its own.</summary>
+    private static QuickJs Instantiate(QuickJsOptions options)
     {
-        var wasm = options.WasmBytes ?? LoadDefaultWasm() ?? throw new InvalidOperationException("quickjs.wasm not found. Set QuickJsOptions.WasmBytes or place quickjs.wasm in Resources/.");
-        var engine = new Engine();
-        var module = Module.FromBytes(engine, "quickjs", wasm);
-        var store = new Store(engine);
-        var linker = new Linker(engine);
-        var vm = new QuickJs(engine, module, store, linker, new WasiShim());
+        var module = CompiledModules.For(options.WasmBytes);
+        var store = new Store(CompiledModules.Engine);
+        var linker = new Linker(CompiledModules.Engine);
+        var vm = new QuickJs(store, linker, new WasiShim());
         vm.DefineImports(options);
         vm.Instance = linker.Instantiate(store, module);
         vm.Exports = new NativeExports(store, vm.Instance);
-        return Task.FromResult(vm);
+        return vm;
     }
 
-    private static byte[]? LoadDefaultWasm()
+    internal static byte[]? LoadDefaultWasm()
     {
         var assembly = typeof(QuickJs).Assembly;
         var name = assembly.GetManifestResourceNames()
@@ -1147,8 +1137,6 @@ public sealed class QuickJs : IDisposable
         }
 
         _linker.Dispose();
-        _module.Dispose();
-        _engine.Dispose();
     }
 
     private int DrainCompletedTaskBridges(bool scanAll)

@@ -3,7 +3,7 @@
 The TypeScript library (`src/index.ts`, `src/wasi-shim.ts`, `src/extensions.ts`, `test/*.test.ts`) is the
 reference implementation. This document tracks how the .NET host (`src/dotnet/QuickJsWasi`) matches it.
 
-- **Reference:** upstream `quickjs-wasi` 3.6.3 (quickjs-ng v0.17.0). **.NET package:** 1.4.0.
+- **Reference:** upstream `quickjs-wasi` 3.6.3 (quickjs-ng v0.17.0). **.NET package:** 1.5.0.
 - **Status keys:** ✅ ported · ⚠️ ported, behaves differently · ❌ missing · ➕ .NET-only.
 - When you port an upstream change, update the matching row and the [upstream sync log](#upstream-sync-log).
 
@@ -37,6 +37,7 @@ Tests are in `QuickJsWasi.Tests/ParityTests.cs` unless noted.
 - `SetProp` and `DefineProp` throw `JSException` on failure, where TS silently ignores the result.
 - A host callback that throws a `JSException` rethrows the original guest value. TS re-wraps it as a new Error.
 - `NewError(Exception)` sets `name` to the .NET type name.
+- The compiled module and its `Engine` are shared by every VM of the process (1.5.0, `CompiledModules`). TS does the same only when the caller passes a `WebAssembly.Module`. Isolation is unchanged: each VM still has its own `Store`, linear memory, imports and limits. Compiled modules are never evicted.
 
 ## Public API
 
@@ -44,7 +45,7 @@ Tests are in `QuickJsWasi.Tests/ParityTests.cs` unless noted.
 
 | TS | .NET | Status |
 |---|---|---|
-| `create` / `restore` | `CreateAsync` / `RestoreAsync` | ⚠️ `QuickJsOptions` only; falls back to the embedded wasm. Restore rejects extensions. |
+| `create` / `restore` | `CreateAsync` / `RestoreAsync` | ⚠️ `QuickJsOptions` only; falls back to the embedded wasm. Restore rejects extensions. Reuses the process-wide compiled module (see `wasm`). |
 | `serializeSnapshot` / `deserializeSnapshot` | `Snapshot.Serialize` / `Snapshot.Deserialize` | ✅ Same binary format (v1/v2) |
 | `versions` | `Versions` | ✅ `quickjs-wasi` + `quickjs`, cached (no extension versions, Gap 7) |
 | `global` / `undefined` / `null` / `true` / `false` | `Global` / `UndefinedValue` / `NullValue` / `TrueValue` / `FalseValue` | ✅ (created eagerly) |
@@ -102,7 +103,7 @@ Tests are in `QuickJsWasi.Tests/ParityTests.cs` unless noted.
 
 | Option | .NET | Status |
 |---|---|---|
-| `wasm` | `WasmBytes` | ✅ (`byte[]`; embedded fallback) |
+| `wasm` | `WasmBytes` | ⚠️ `byte[]` only; embedded fallback. Since 1.5.0 compiled once per distinct binary (SHA-256 of the content, plus a by-reference lookup per array) and shared by every VM; TS recompiles bytes per `create()` unless given a `WebAssembly.Module`. No compiled-module option: a Wasmtime `Module` is bound to its `Engine`, which is internal (`CompiledModules`). |
 | `memoryLimit` / `interruptHandler` / `onUnhandledRejection` / `moduleLoader` / `intrinsics` | same | ✅ |
 | `maxStackSize` | `MaxStackSize` | ✅ Range-checked (`ArgumentOutOfRangeException` instead of `RangeError`) |
 | `timezoneOffset` | `TimezoneOffset` (`Host` / `Fixed` / `Callback`) | ✅ |
