@@ -1405,7 +1405,7 @@ Measured on Ubuntu 22.04 x64 · .NET 10.0 · Intel Xeon Platinum 8370C @ 2.80 GH
 | Promise — create Deferred | 3.2 μs | 528 B |
 | Promise — resolve + await | 31 μs | 2.4 KB |
 
-> **Note:** Cold-start cost is dominated by Wasmtime WASM module instantiation and is paid once per `QuickJs.CreateAsync()` call. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
+> **Note:** Since 1.4.1 the WASM module is compiled once per process and shared, so cold start is only instantiation: see *Creating VMs* below. The figures above were measured before that change. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
 
 ### Promises and the async host bridge
 
@@ -1429,6 +1429,26 @@ Run only these with `--filter "*Promise_*" "*AsyncHost_*" "*AsyncBridge*"`.
 Concurrent host calls cost ~10 μs / ~3.8 KB each, linearly. Pending host tasks no longer slow down
 unrelated guest jobs: before 1.4.0 the bridge rescanned every in-flight task after each job
 (3.98 ms at N = 1 000).
+
+### Creating VMs — one at a time and side by side
+
+Measured on Windows 11 · .NET 10.0 · Intel Core i7-11370H (8 logical cores) · `BenchmarkDotNet v0.15.8` (`--job short`).
+Run only these with `--filter "*VmCreation*"`. `VmCreationBenchmarks` creates, or restores from a snapshot and runs one
+call in, `AtOnce` VMs side by side — what a server pays when it gives each request a fresh VM.
+
+| Benchmark | AtOnce | 1.4.0 | 1.4.1 | Faster |
+|---|---|---|---|---|
+| Create VMs side by side | 1 | 161.3 ms | 1.01 ms | ×160 |
+| Create VMs side by side | 8 | 1,053.2 ms | 1.66 ms | ×635 |
+| Create VMs side by side | 32 | 4,203.8 ms | 5.56 ms | ×756 |
+| Restore VMs side by side and run one call | 1 | 148.2 ms | 0.77 ms | ×191 |
+| Restore VMs side by side and run one call | 8 | 1,057.1 ms | 2.04 ms | ×519 |
+| Restore VMs side by side and run one call | 32 | 4,236.2 ms | 7.29 ms | ×581 |
+
+Allocations fall too, from 88.8 KB to 13.8 KB per created VM. Before 1.4.1, every `CreateAsync`/`RestoreAsync` built
+a new Wasmtime `Engine` and compiled the module from bytes. That took ~150 ms and didn't scale across cores: 32 VMs
+took 32 times as long as one. Now the compiled module is shared (`CompiledModules`), a VM costs about a millisecond,
+and VMs are created in parallel.
 
 ---
 
