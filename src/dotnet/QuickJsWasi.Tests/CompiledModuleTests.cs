@@ -29,6 +29,21 @@ public sealed class CompiledModuleTests : TestBase
     }
 
     [Fact]
+    public async Task An_array_passed_again_is_recognised_by_reference_without_rehashing()
+    {
+        if (!HasWasm) return;
+
+        var bytes = (byte[])WasmBytes!.Clone();
+        Assert.False(CompiledModules.IsKnown(bytes));
+
+        using var first = await QuickJs.CreateAsync(new QuickJsOptions { WasmBytes = bytes });
+
+        Assert.True(CompiledModules.IsKnown(bytes));
+        Assert.Same(CompiledModules.For(WasmBytes), CompiledModules.For(bytes));
+        Assert.False(CompiledModules.IsKnown((byte[])bytes.Clone()));
+    }
+
+    [Fact]
     public async Task Disposing_a_vm_leaves_the_others_and_the_next_ones_working()
     {
         if (!HasWasm) return;

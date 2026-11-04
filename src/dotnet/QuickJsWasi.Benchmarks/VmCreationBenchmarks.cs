@@ -4,7 +4,7 @@ namespace QuickJsWasi.Benchmarks;
 
 /// <summary>
 /// What a host pays to get a fresh VM, one at a time and many at once — a server restores one per request. Before
-/// 1.4.1 each VM compiled the WASM module afresh (~150 ms, not scaling across cores); since, the compiled module is
+/// 1.5.0 each VM compiled the WASM module afresh (~150 ms, not scaling across cores); since, the compiled module is
 /// shared and a VM costs its own store and memory only.
 ///
 /// Run with:

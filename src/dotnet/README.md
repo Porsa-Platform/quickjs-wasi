@@ -13,7 +13,7 @@ compiled to a WASI reactor WebAssembly binary and exposes it through a clean C# 
 - **Promise bridging** — drive the JS microtask queue and `await` QuickJS promises from .NET `Task`.
 - **Sandboxed** — memory limits, stack limits, interrupt handlers, and selective intrinsic removal.
 - **Zero native deps** — the entire QuickJS engine ships as an embedded WASM binary inside the NuGet package.
-- **Cheap to create** — the WASM module is compiled once per process (per distinct binary) and shared by every VM, so a `CreateAsync`/`RestoreAsync` costs about a millisecond and VMs are created in parallel. Before 1.4.1 each one compiled the module afresh (~150 ms, serialized).
+- **Cheap to create** — the WASM module is compiled once per process (per distinct binary) and shared by every VM, so a `CreateAsync`/`RestoreAsync` costs under a millisecond and VMs are created in parallel. Before 1.5.0 each one compiled the module afresh (~150 ms, serialized).
 
 ---
 
@@ -96,6 +96,15 @@ If you want to supply your own WASM build (e.g. a custom instrumented build or a
 var wasmBytes = await File.ReadAllBytesAsync("quickjs.wasm");
 using var vm = await QuickJs.CreateAsync(new QuickJsOptions { WasmBytes = wasmBytes });
 ```
+
+The module is compiled once per distinct binary and shared by every VM of the process (see [Creating VMs](#creating-vms--one-at-a-time-and-side-by-side)):
+
+- **Identity is the content.** A binary is identified by the SHA-256 of its bytes, so two arrays with the same content share one compiled module. The first VM of a binary pays the compile (~150 ms); later ones cost under a millisecond.
+- **Keep and reuse the array.** Each `byte[]` is also remembered by reference, so passing the same array again skips the hash (~0.4 ms for the 750 KB binary). Reading the file anew for every VM still works, just with that hash each time.
+- **Don't mutate the array** after passing it: a reused array is matched by reference, so the module compiled from its first content would keep being used.
+- **Compiled modules are kept for the life of the process.** Each distinct binary stays compiled (a few MB of machine code), so a host cycling through many different binaries grows memory. Your own binary and the embedded one are cached separately, even if their bytes are identical.
+
+There is no option to pass an already-compiled Wasmtime `Module`, unlike TS's `WebAssembly.Module`: a Wasmtime module belongs to the `Engine` that compiled it, and the shared engine is internal. The cache gives the same benefit.
 
 ### Building from source
 
@@ -1166,7 +1175,7 @@ Pass a custom shim via `QuickJsOptions.WasiShim` — **wait**, the public `Creat
 
 | Property               | Type                    | Default          | Description                      |
 | ---------------------- | ----------------------- | ---------------- | -------------------------------- |
-| `WasmBytes`            | `byte[]?`               | embedded binary  | Raw WASM bytes                   |
+| `WasmBytes`            | `byte[]?`               | embedded binary  | Raw WASM bytes, compiled once per distinct binary and cached; don't mutate after passing |
 | `MemoryLimit`          | `long?`                 | unlimited        | Max JS heap in bytes             |
 | `MaxStackSize`         | `long?`                 | engine default   | Max call stack in bytes          |
 | `InterruptHandler`     | `Func<bool>?`           | none             | Return `true` to interrupt       |
@@ -1252,6 +1261,7 @@ Tests skip gracefully when `quickjs.wasm` is absent (the binary is git-ignored),
 | `Symbol`                                         | `JsSymbol` record                            | Global symbols marshal as `new JsSymbol(description, isGlobal: true)`; local symbols → `QuickJs.Undefined`.           |
 | `bigint`                                         | `long` / `BigInteger`                        | `Dump` returns `long`; `HostToHandle` accepts `long` or `BigInteger`.                                                 |
 | `async create()`                                 | `Task<QuickJs> CreateAsync()`                | Returns a completed task; async signature kept for compatibility.                                                     |
+| `wasm: BufferSource \| WebAssembly.Module`        | `WasmBytes` (`byte[]`)                       | TS recompiles bytes on every `create()` unless given a compiled module. .NET compiles once per distinct binary and shares it; no compiled-module option (a Wasmtime module is bound to its internal `Engine`). |
 | `resolvePromise()` → `Promise<{value}\|{error}>` | `ResolvePromise()` → `Task<JSPromiseResult>` | `JSPromiseResult` is a discriminated union.                                                                           |
 | `versions` includes npm package version          | `Versions` includes engine version only      | No equivalent of the npm package version in .NET.                                                                     |
 | `hostToHandle(Promise)` wraps host promises      | `HostToHandle(Task/Task<T>)` wraps host tasks | Both sides bridge host async work by returning a QuickJS promise immediately and settling it later.                   |
@@ -1405,7 +1415,7 @@ Measured on Ubuntu 22.04 x64 · .NET 10.0 · Intel Xeon Platinum 8370C @ 2.80 GH
 | Promise — create Deferred | 3.2 μs | 528 B |
 | Promise — resolve + await | 31 μs | 2.4 KB |
 
-> **Note:** Since 1.4.1 the WASM module is compiled once per process and shared, so cold start is only instantiation: see *Creating VMs* below. The figures above were measured before that change. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
+> **Note:** Since 1.5.0 the WASM module is compiled once per process and shared, so cold start is only instantiation: see *Creating VMs* below. The figures above were measured before that change. Hot-VM numbers reflect steady-state throughput. The WASM binary is embedded in the NuGet package; no file I/O occurs at runtime.
 
 ### Promises and the async host bridge
 
@@ -1436,18 +1446,22 @@ Measured on Windows 11 · .NET 10.0 · Intel Core i7-11370H (8 logical cores) ·
 Run only these with `--filter "*VmCreation*"`. `VmCreationBenchmarks` creates, or restores from a snapshot and runs one
 call in, `AtOnce` VMs side by side — what a server pays when it gives each request a fresh VM.
 
-| Benchmark | AtOnce | 1.4.0 | 1.4.1 | Faster |
+| Benchmark | AtOnce | 1.4.0 | 1.5.0 | Faster |
 |---|---|---|---|---|
-| Create VMs side by side | 1 | 161.3 ms | 1.01 ms | ×160 |
-| Create VMs side by side | 8 | 1,053.2 ms | 1.66 ms | ×635 |
-| Create VMs side by side | 32 | 4,203.8 ms | 5.56 ms | ×756 |
-| Restore VMs side by side and run one call | 1 | 148.2 ms | 0.77 ms | ×191 |
-| Restore VMs side by side and run one call | 8 | 1,057.1 ms | 2.04 ms | ×519 |
-| Restore VMs side by side and run one call | 32 | 4,236.2 ms | 7.29 ms | ×581 |
+| Create VMs side by side | 1 | 161.3 ms | 0.50 ms | ×321 |
+| Create VMs side by side | 8 | 1,053.2 ms | 1.08 ms | ×977 |
+| Create VMs side by side | 32 | 4,203.8 ms | 3.36 ms | ×1,252 |
+| Restore VMs side by side and run one call | 1 | 148.2 ms | 0.52 ms | ×288 |
+| Restore VMs side by side and run one call | 8 | 1,057.1 ms | 1.75 ms | ×605 |
+| Restore VMs side by side and run one call | 32 | 4,236.2 ms | 6.04 ms | ×702 |
 
-Allocations fall too, from 88.8 KB to 13.8 KB per created VM. Before 1.4.1, every `CreateAsync`/`RestoreAsync` built
+The benchmark keeps passing the same `WasmBytes` array, so it measures the by-reference lookup: hashing the binary on
+every call instead (as a fresh array would) adds ~0.4 ms per VM — 1.01 ms for a single create. `--job short` has wide
+error bars at this scale; treat the 1.5.0 column as an order of magnitude.
+
+Allocations fall too, from 88.8 KB to 13.3 KB per created VM. Before 1.5.0, every `CreateAsync`/`RestoreAsync` built
 a new Wasmtime `Engine` and compiled the module from bytes. That took ~150 ms and didn't scale across cores: 32 VMs
-took 32 times as long as one. Now the compiled module is shared (`CompiledModules`), a VM costs about a millisecond,
+took 32 times as long as one. Now the compiled module is shared (`CompiledModules`), a VM costs under a millisecond,
 and VMs are created in parallel.
 
 ---
