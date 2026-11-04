@@ -89,7 +89,7 @@ dotnet pack QuickJsWasi/QuickJsWasi.csproj -c Release -o nupkg/
 
 ### `QuickJs` (QuickJs.cs)
 
-The only class you interact with directly. It owns the Wasmtime `Engine`, `Module`, `Store`, and `Linker`, and exposes the entire JS API through typed methods.
+The only class you interact with directly. It owns its Wasmtime `Store` and `Linker` and exposes the entire JS API through typed methods. The `Engine` and the compiled `Module` are shared by every VM of the process (`CompiledModules`, one module per distinct WASM binary, never disposed): compiling the module is the expensive step (~150 ms), and a Wasmtime `Module` is immutable and thread-safe.
 
 **Lifecycle:**
 1. `CreateAsync(options?)` — instantiates the WASM module, calls the WASI `_initialize` export, and returns the ready-to-use VM.

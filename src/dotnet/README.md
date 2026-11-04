@@ -13,6 +13,7 @@ compiled to a WASI reactor WebAssembly binary and exposes it through a clean C# 
 - **Promise bridging** — drive the JS microtask queue and `await` QuickJS promises from .NET `Task`.
 - **Sandboxed** — memory limits, stack limits, interrupt handlers, and selective intrinsic removal.
 - **Zero native deps** — the entire QuickJS engine ships as an embedded WASM binary inside the NuGet package.
+- **Cheap to create** — the WASM module is compiled once per process (per distinct binary) and shared by every VM, so a `CreateAsync`/`RestoreAsync` costs about a millisecond and VMs are created in parallel. Before 1.4.1 each one compiled the module afresh (~150 ms, serialized).
 
 ---
 
